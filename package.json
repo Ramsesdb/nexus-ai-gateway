@@ -1,11 +1,16 @@
 {
-  "name": "bun-ai-api",
+  "name": "nexus-ai-gateway",
+  "version": "1.0.0",
+  "description": "Production-ready AI Gateway with circuit breaker, graceful shutdown, and health-aware load balancing (2026)",
   "module": "index.ts",
   "type": "module",
   "private": true,
   "scripts": {
     "start": "bun run index.ts",
-    "dev": "bun --watch run index.ts"
+    "dev": "bun --watch run index.ts",
+    "build": "bun build ./index.ts --target=bun --outdir=./dist --minify",
+    "start:prod": "bun run ./dist/index.js",
+    "typecheck": "bunx tsc --noEmit"
   },
   "devDependencies": {
     "@types/bun": "latest"
@@ -14,7 +19,10 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@cerebras/cerebras_cloud_sdk": "^1.59.0",
-    "groq-sdk": "^0.37.0"
+    "@google/generative-ai": "^0.24.1",
+    "openai": "^4.104.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
   }
 }

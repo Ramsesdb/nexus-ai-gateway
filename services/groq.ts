@@ -1,26 +1,25 @@
-import { Groq } from 'groq-sdk';
-import type { AIService, ChatMessage } from '../types';
+/**
+ * Groq Service - Ultra-fast inference with Llama 4
+ * Model configurable via GROQ_MODEL env var
+ * Uses OpenAI-compatible API for consistency
+ */
 
-const groq = new Groq();
+import { BaseOpenAIService } from './base';
 
-export const groqService: AIService = {
-  name: 'Groq',
-  async chat(messages: ChatMessage[]) {
-    const chatCompletion = await groq.chat.completions.create({
-      messages,
-      model: "moonshotai/kimi-k2-instruct-0905",
-      temperature: 0.6,
-      max_completion_tokens: 4096,
-      top_p: 1,
-      stream: true,
-      stop: null
+export class GroqService extends BaseOpenAIService {
+  constructor(apiKey: string, instanceId: string = '1') {
+    if (!apiKey) {
+      throw new Error('Groq API key is required');
+    }
+
+    super({
+      provider: 'groq',
+      displayName: 'Groq',
+      apiKey,
+      instanceId,
+      baseURL: 'https://api.groq.com/openai/v1',
+      defaultModel: 'llama-4-scout-17b-16e-instruct',
+      modelEnvVar: 'GROQ_MODEL',
     });
-    
-    return (async function* () {
-      for await (const chunk of chatCompletion) {
-        yield chunk.choices[0]?.delta?.content || ''
-      }
-    })()
   }
 }
-
