@@ -1,24 +1,30 @@
-import Cerebras from '@cerebras/cerebras_cloud_sdk';
-import type { AIService, ChatMessage } from '../types';
+/**
+ * Cerebras Service - Ultra-fast inference on WSE hardware
+ * Model configurable via CEREBRAS_MODEL env var
+ * Note: Using OpenAI-compatible API instead of native SDK for consistency
+ */
 
-const cerebras = new Cerebras();
+import { BaseOpenAIService } from './base';
 
-export const cerebrasService: AIService = {
-  name: 'Cerebras',
-  async chat(messages: ChatMessage[]) {
-    const stream = await cerebras.chat.completions.create({
-      messages: messages as any,
-      model: 'zai-glm-4.6',
-      stream: true,
-      max_completion_tokens: 40960,
-      temperature: 0.6,
-      top_p: 0.95
+export class CerebrasService extends BaseOpenAIService {
+  constructor(apiKey: string, instanceId: string = '1') {
+    if (!apiKey) {
+      throw new Error('Cerebras API key is required');
+    }
+
+    super({
+      provider: 'cerebras',
+      displayName: 'Cerebras',
+      apiKey,
+      instanceId,
+      baseURL: 'https://api.cerebras.ai/v1',
+      defaultModel: 'zai-glm-4.7',
+      modelEnvVar: 'CEREBRAS_MODEL',
+      extraCreateParams: {
+        max_completion_tokens: 40960,
+        temperature: 0.6,
+        top_p: 0.95,
+      },
     });
-
-    return (async function* () {
-      for await (const chunk of stream) {
-        yield (chunk as any).choices[0]?.delta?.content || ''
-      }
-    })()
   }
 }
