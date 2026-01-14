@@ -19,7 +19,12 @@ import type {
 const CONFIG = {
   port: Number(process.env.PORT) || 3000,
   firstTokenTimeoutMs: Number(process.env.FIRST_TOKEN_TIMEOUT_MS) || 8000,
-  corsOrigin: process.env.CORS_ORIGIN || '*',
+
+  // Security: Master API Key (optional, but highly recommended for production)
+  masterKey: process.env.NEXUS_MASTER_KEY || '',
+
+  // Security: CORS whitelist (comma-separated origins, or '*' for all)
+  corsAllowedOrigins: (process.env.CORS_ORIGINS || '*').split(',').map(s => s.trim()),
 
   // Health scoring
   errorPenaltyDurationMs: 30_000,
@@ -59,6 +64,7 @@ interface EnhancedTrackedService extends TrackedService {
 }
 
 const trackedServices: EnhancedTrackedService[] = [];
+let roundRobinPointer = 0;
 
 // In-flight request counter for graceful shutdown
 let inFlightRequests = 0;
@@ -73,6 +79,15 @@ interface ProviderKeyConfig {
 }
 
 const collectProviderKeys = (): ProviderKeyConfig[] => {
+  // Provider priority for load balancing (higher = preferred)
+  // Strategy: Cerebras (fastest) > Groq (reliable) > OpenRouter (free) > Gemini (avoid abuse blocks)
+  const providerPriorityOrder: Record<ProviderType, number> = {
+    cerebras: 10,  // Best free tier: 1M tokens/day, 2000+ tok/s
+    groq: 8,       // Reliable backup: 500+ tok/s
+    openrouter: 6, // Free tier backup
+    gemini: 2,     // LAST RESORT - can block for abuse from same IP
+  };
+
   const patterns = [
     { provider: 'groq' as ProviderType, prefix: 'GROQ_KEY_', priority: 2 },
     { provider: 'gemini' as ProviderType, prefix: 'GEMINI_KEY_', priority: 2 },
@@ -110,8 +125,11 @@ const collectProviderKeys = (): ProviderKeyConfig[] => {
     }
   }
 
+  // Sort by: 1) Provider priority (descending), 2) Instance ID (ascending)
   return [...chosen.values()].sort((a, b) => {
-    if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
+    const priorityA = providerPriorityOrder[a.provider] || 0;
+    const priorityB = providerPriorityOrder[b.provider] || 0;
+    if (priorityA !== priorityB) return priorityB - priorityA; // Higher priority first
     return Number(a.instanceId) - Number(b.instanceId);
   });
 };
@@ -152,6 +170,7 @@ for (const config of collectProviderKeys()) {
       service,
       metrics: createInitialMetrics(),
       circuitBreaker: createInitialCircuitBreaker(),
+      enabled: true, // Initialize enabled to true
     });
   } catch (error) {
     console.warn(`Failed to initialize ${config.provider} #${config.instanceId}:`, error);
@@ -253,14 +272,27 @@ const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(r
 // --- 7. HEALTH-AWARE LOAD BALANCER ---
 
 const calculateHealthScore = (tracked: EnhancedTrackedService): number => {
-  const { metrics, circuitBreaker: cb } = tracked;
+  const { metrics, circuitBreaker: cb, service } = tracked;
 
   // Circuit breaker penalty
   if (cb.state === 'OPEN') return 0;
   if (cb.state === 'HALF_OPEN') return 0.1;
 
+  // Provider priority bonus (ensures preferred providers are selected when scores are similar)
+  const priorityBonus: Record<ProviderType, number> = {
+    cerebras: 0.15,   // Highest priority: fastest, best free tier
+    groq: 0.10,       // Second priority: reliable
+    openrouter: 0.05, // Third priority: free backup
+    gemini: 0.00,     // Last resort: can block for abuse
+  };
+  const providerName = service.name.toLowerCase();
+  const bonus = providerName.includes('cerebras') ? priorityBonus.cerebras :
+    providerName.includes('groq') ? priorityBonus.groq :
+      providerName.includes('openrouter') ? priorityBonus.openrouter :
+        priorityBonus.gemini;
+
   if (metrics.totalRequests < CONFIG.minRequestsForScoring) {
-    return 0.5;
+    return 0.5 + bonus; // Base score + priority bonus
   }
 
   const successRate = metrics.successCount / metrics.totalRequests;
@@ -275,19 +307,29 @@ const calculateHealthScore = (tracked: EnhancedTrackedService): number => {
     }
   }
 
-  return Math.max(0, Math.min(1, successRate * 0.5 + latencyScore * 0.3 - recentErrorPenalty));
+  return Math.max(0, Math.min(1, successRate * 0.5 + latencyScore * 0.3 + bonus - recentErrorPenalty));
 };
 
 /**
- * Select next available service, respecting circuit breaker state
+ * Select next available service, respecting circuit breaker state and enabled status
  */
-const getNextService = (excludeIndices: Set<number>): EnhancedTrackedService | null => {
+const getNextService = (
+  excludeIndices: Set<number>,
+  routingMode: 'smart' | 'fastest' | 'round-robin' = 'smart'
+): EnhancedTrackedService | null => {
   const available = trackedServices
     .map((ts, index) => ({ ts, index }))
-    .filter(({ ts, index }) => !excludeIndices.has(index) && isServiceAvailable(ts));
+    .filter(({ ts, index }) => !excludeIndices.has(index) && ts.enabled && isServiceAvailable(ts)); // Filter out disabled services
 
   if (available.length === 0) return null;
   if (available.length === 1) return available[0]!.ts;
+
+  if (routingMode === 'round-robin') {
+    const sorted = available.sort((a, b) => a.index - b.index);
+    const choice = sorted[roundRobinPointer % sorted.length]!.ts;
+    roundRobinPointer = (roundRobinPointer + 1) % trackedServices.length;
+    return choice;
+  }
 
   const scored = available.map(({ ts, index }) => ({
     ts,
@@ -296,6 +338,10 @@ const getNextService = (excludeIndices: Set<number>): EnhancedTrackedService | n
   }));
 
   scored.sort((a, b) => b.score - a.score);
+
+  if (routingMode === 'fastest') {
+    return scored[0]!.ts;
+  }
 
   const totalScore = scored.reduce((sum, s) => sum + Math.max(0.1, s.score), 0);
   let random = Math.random() * totalScore;
@@ -361,16 +407,12 @@ const shutdown = async (signal: string): Promise<void> => {
   process.exit(0);
 };
 
-// Register shutdown handlers
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-
 // --- 10. SERVER ---
 
 console.log(`🚀 Nexus AI Gateway v1.0 running on port ${CONFIG.port}`);
 console.log(`🛡️  Active Providers: ${trackedServices.length}`);
 console.log(`📊 Load Balancing: Health-Aware + Circuit Breaker`);
-console.log(`🌐 CORS Origin: ${CONFIG.corsOrigin}`);
+console.log(`🌐 CORS Origins: ${CONFIG.corsAllowedOrigins.join(', ')}`);
 console.log(`⚡ Circuit Breaker: ${CONFIG.circuitBreaker.failureThreshold} failures -> OPEN for ${CONFIG.circuitBreaker.resetTimeoutMs / 1000}s`);
 
 const server = Bun.serve({
@@ -387,15 +429,75 @@ const server = Bun.serve({
 
     const url = new URL(req.url);
 
+    // --- SECURITY: CORS Whitelist ---
+    const requestOrigin = req.headers.get('Origin') || '';
+    const isWildcard = CONFIG.corsAllowedOrigins.includes('*');
+    const isOriginAllowed = isWildcard ||
+      CONFIG.corsAllowedOrigins.includes(requestOrigin) ||
+      requestOrigin === 'null'; // file:// protocol sends 'null' as origin
     const corsHeaders = {
-      'Access-Control-Allow-Origin': CONFIG.corsOrigin,
+      'Access-Control-Allow-Origin': isWildcard ? '*' : (isOriginAllowed ? requestOrigin : ''),
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Routing-Mode',
     };
 
     // CORS Preflight
     if (req.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
+    }
+
+    // --- SECURITY: Master Key Authentication ---
+    // Skip auth for health check (allows monitoring tools to work)
+    if (CONFIG.masterKey && url.pathname !== '/health') {
+      const authHeader = req.headers.get('Authorization');
+      if (authHeader !== `Bearer ${CONFIG.masterKey}`) {
+        return new Response(
+          JSON.stringify({
+            error: { message: 'Unauthorized: Invalid or missing API key', type: 'authentication_error' },
+          }),
+          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+    }
+
+    // Provider enable/disable toggle
+    if (req.method === 'POST' && url.pathname === '/v1/providers/toggle') {
+      try {
+        const body = await req.json() as { name?: string; enabled?: boolean };
+
+        if (!body?.name || typeof body.enabled !== 'boolean') {
+          return new Response(
+            JSON.stringify({ error: { message: 'Missing name or enabled flag', type: 'invalid_request_error' } }),
+            { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+          );
+        }
+
+        const target = trackedServices.find(ts => ts.service.name === body.name);
+        if (!target) {
+          return new Response(
+            JSON.stringify({ error: { message: 'Provider not found', type: 'not_found' } }),
+            { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+          );
+        }
+
+        target.enabled = body.enabled;
+
+        const responseBody = {
+          name: target.service.name,
+          provider: target.service.provider,
+          enabled: target.enabled,
+        };
+
+        return new Response(JSON.stringify(responseBody), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      } catch (error) {
+        console.error('[Toggle Provider] Error parsing request', error);
+        return new Response(
+          JSON.stringify({ error: { message: 'Invalid JSON payload', type: 'invalid_request_error' } }),
+          { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
     }
 
     // Health Check
@@ -407,28 +509,33 @@ const server = Bun.serve({
         uptime: process.uptime(),
         inFlightRequests,
         config: {
-          corsOrigin: CONFIG.corsOrigin,
+          corsAllowedOrigins: CONFIG.corsAllowedOrigins,
           firstTokenTimeoutMs: CONFIG.firstTokenTimeoutMs,
           circuitBreaker: CONFIG.circuitBreaker,
           backoff: CONFIG.backoff,
         },
-        providers: trackedServices.map(ts => ({
-          name: ts.service.name,
-          provider: ts.service.provider,
-          circuitState: ts.circuitBreaker.state,
-          metrics: {
-            totalRequests: ts.metrics.totalRequests,
-            successRate: ts.metrics.totalRequests > 0
-              ? `${(ts.metrics.successCount / ts.metrics.totalRequests * 100).toFixed(1)}%`
-              : 'N/A',
-            avgLatencyMs: ts.metrics.totalRequests > 0
-              ? Math.round(ts.metrics.totalLatencyMs / ts.metrics.totalRequests)
-              : 0,
-            healthScore: `${(calculateHealthScore(ts) * 100).toFixed(1)}%`,
-            consecutiveFailures: ts.circuitBreaker.failures,
-            lastError: ts.metrics.lastError || null,
-          },
-        })),
+        providers: trackedServices.map(ts => {
+          const total = ts.metrics.totalRequests || 0;
+          const success = ts.metrics.successCount || 0;
+          const fail = ts.metrics.failCount || 0;
+          const latency = ts.metrics.totalLatencyMs || 0;
+          return {
+            name: ts.service.name,
+            provider: ts.service.provider,
+            circuitState: ts.circuitBreaker.state,
+            metrics: {
+              totalRequests: total,
+              successCount: success,
+              failCount: fail,
+              successRate: total > 0 ? `${((success / total) * 100).toFixed(1)}%` : 'N/A',
+              avgLatency: total > 0 ? Math.round(latency / total) : 0,
+              healthScore: `${(calculateHealthScore(ts) * 100).toFixed(1)}%`,
+              consecutiveFailures: ts.circuitBreaker.failures,
+              lastError: ts.metrics.lastError || null,
+            },
+            enabled: ts.enabled, // Expose enabled state
+          };
+        }),
       };
 
       return new Response(JSON.stringify(healthData, null, 2), {
@@ -444,7 +551,7 @@ const server = Bun.serve({
           id: ts.service.name,
           object: 'model',
           owned_by: ts.service.provider,
-          available: isServiceAvailable(ts),
+          available: ts.enabled && isServiceAvailable(ts),
         })),
       };
 
@@ -456,12 +563,15 @@ const server = Bun.serve({
     // Chat Completions
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
       inFlightRequests++;
+      let hasDecrementedInFlight = false; // Prevent double decrement - declared here for catch scope
 
       try {
         const body = await req.json() as { messages?: unknown };
         const messages = body.messages;
 
         if (!Array.isArray(messages) || !messages.every(isValidMessage)) {
+          inFlightRequests--;
+          hasDecrementedInFlight = true;
           return new Response(
             JSON.stringify({ error: { message: 'Invalid messages format', type: 'invalid_request_error' } }),
             { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
@@ -472,9 +582,21 @@ const server = Bun.serve({
         const requestId = `chatcmpl-${crypto.randomUUID()}`;
         const created = Math.floor(Date.now() / 1000);
         const encoder = new TextEncoder();
+        const routingModeHeader = (req.headers.get('x-routing-mode') || 'smart').toLowerCase();
+        const routingMode: 'smart' | 'fastest' | 'round-robin' =
+          routingModeHeader === 'fastest' || routingModeHeader === 'round-robin'
+            ? routingModeHeader
+            : 'smart';
 
         let aborted = false;
         const triedIndices = new Set<number>();
+
+        const decrementInFlight = () => {
+          if (!hasDecrementedInFlight) {
+            hasDecrementedInFlight = true;
+            inFlightRequests--;
+          }
+        };
 
         const onAbort = () => { aborted = true; };
         req.signal?.addEventListener?.('abort', onAbort, { once: true } as EventListenerOptions);
@@ -502,7 +624,7 @@ const server = Bun.serve({
 
               // Try each service with exponential backoff
               while (triedIndices.size < trackedServices.length && !aborted) {
-                const tracked = getNextService(triedIndices);
+                const tracked = getNextService(triedIndices, routingMode);
                 if (!tracked) {
                   // All circuits might be open - wait and check again
                   if (attemptNumber > 0) {
@@ -539,7 +661,7 @@ const server = Bun.serve({
                   tracked.circuitBreaker.halfOpenAttempts++;
                 }
 
-                console.log(`[Router] Attempt ${attemptNumber}/${trackedServices.length} -> ${service.name} [${tracked.circuitBreaker.state}]`);
+                console.log(`[Router] Attempt ${attemptNumber}/${trackedServices.length} -> ${service.name} [${tracked.circuitBreaker.state}] mode=${routingMode}`);
                 tracked.metrics.totalRequests++;
 
                 try {
@@ -624,13 +746,13 @@ const server = Bun.serve({
               controller.close();
             } finally {
               req.signal?.removeEventListener?.('abort', onAbort);
-              inFlightRequests--;
+              decrementInFlight();
             }
           },
           cancel() {
             aborted = true;
             req.signal?.removeEventListener?.('abort', onAbort);
-            inFlightRequests--;
+            decrementInFlight();
           },
         });
 
@@ -644,7 +766,10 @@ const server = Bun.serve({
           },
         });
       } catch (error) {
-        inFlightRequests--;
+        if (!hasDecrementedInFlight) {
+          hasDecrementedInFlight = true;
+          inFlightRequests--;
+        }
         console.error('Internal Server Error:', error);
         return new Response(
           JSON.stringify({ error: { message: 'Internal Error', type: 'internal_error' } }),
@@ -656,3 +781,7 @@ const server = Bun.serve({
     return new Response('Not Found', { status: 404, headers: corsHeaders });
   },
 });
+
+// Register shutdown handlers (after server is created)
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

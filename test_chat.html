@@ -1,0 +1,1018 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nexus AI Control Center v2</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <style>
+        :root {
+            --bg-dark: #0a0a1a;
+            --bg-panel: rgba(20, 20, 40, 0.8);
+            --bg-card: rgba(30, 30, 60, 0.6);
+            --bg-input: rgba(0, 0, 0, 0.4);
+            --accent-primary: #00ff88;
+            --accent-blue: #00d4ff;
+            --accent-purple: #a855f7;
+            --accent-orange: #ff8c00;
+            --accent-red: #ff4757;
+            --text-primary: #f0f0f0;
+            --text-secondary: #888;
+            --border: rgba(255, 255, 255, 0.08);
+            --glass: rgba(255, 255, 255, 0.03);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(135deg, var(--bg-dark) 0%, #1a1a3e 100%);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Header */
+        .header {
+            background: var(--bg-panel);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border);
+            padding: 15px 25px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.3rem;
+        }
+
+        .logo h1 {
+            font-size: 1.2rem;
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-primary));
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logo span {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .header-controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--glass);
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--accent-primary);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .status-dot.error {
+            background: var(--accent-red);
+        }
+
+        /* Main Layout */
+        .main-container {
+            display: grid;
+            grid-template-columns: 1fr 420px;
+            gap: 20px;
+            padding: 20px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        @media (max-width: 1200px) {
+            .main-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Panels */
+        .panel {
+            background: var(--bg-panel);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+        }
+
+        .panel-header {
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .panel-header h2 {
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .panel-content {
+            padding: 20px;
+        }
+
+        /* Chat Panel */
+        .chat-panel {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 140px);
+        }
+
+        .chat-panel .panel-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px;
+        }
+
+        .message {
+            max-width: 85%;
+            margin-bottom: 15px;
+            animation: slideIn 0.3s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message.user {
+            margin-left: auto;
+        }
+
+        .message.user .bubble {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border-radius: 16px 16px 4px 16px;
+        }
+
+        .message.assistant .bubble {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px 16px 16px 4px;
+        }
+
+        .bubble {
+            padding: 12px 16px;
+            line-height: 1.6;
+            font-size: 0.95rem;
+        }
+
+        .message-meta {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            margin-bottom: 4px;
+            display: flex;
+            gap: 10px;
+        }
+
+        .model-tag {
+            color: var(--accent-blue);
+            font-weight: 600;
+        }
+
+        .latency-tag {
+            color: var(--accent-primary);
+            font-family: monospace;
+        }
+
+        /* Input Area */
+        .input-area {
+            padding: 15px 20px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: 10px;
+        }
+
+        .input-area input {
+            flex: 1;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            padding: 14px 18px;
+            border-radius: 12px;
+            color: white;
+            font-size: 0.95rem;
+            outline: none;
+            transition: all 0.2s;
+        }
+
+        .input-area input:focus {
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 20px rgba(0, 212, 255, 0.15);
+        }
+
+        .btn {
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            color: white;
+            border: none;
+            padding: 14px 24px;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.9rem;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(0, 212, 255, 0.3);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-secondary {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+        }
+
+        .btn-sm {
+            padding: 8px 16px;
+            font-size: 0.8rem;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        /* Metrics Grid */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+        }
+
+        .metric-card {
+            background: var(--bg-card);
+            padding: 15px;
+            border-radius: 12px;
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+
+        .metric-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-primary));
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .metric-label {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+            text-transform: uppercase;
+        }
+
+        /* Provider Cards */
+        .provider-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px 15px;
+            margin-bottom: 10px;
+            transition: all 0.2s;
+        }
+
+        .provider-card:hover {
+            border-color: var(--accent-blue);
+        }
+
+        .provider-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .provider-name {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+        }
+
+        .provider-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.9rem;
+        }
+
+        .provider-icon.cerebras {
+            background: linear-gradient(135deg, #a855f7, #6366f1);
+        }
+
+        .provider-icon.groq {
+            background: linear-gradient(135deg, #f59e0b, #ef4444);
+        }
+
+        .provider-icon.openrouter {
+            background: linear-gradient(135deg, #10b981, #14b8a6);
+        }
+
+        .provider-icon.gemini {
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+        }
+
+        .health-bar {
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .health-fill {
+            height: 100%;
+            background: var(--accent-primary);
+            transition: width 0.5s ease;
+        }
+
+        .health-fill.warning {
+            background: var(--accent-orange);
+        }
+
+        .health-fill.error {
+            background: var(--accent-red);
+        }
+
+        .provider-stats {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 8px;
+        }
+
+        /* Toggle Switch */
+        .switch {
+            position: relative;
+            width: 44px;
+            height: 24px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            inset: 0;
+            background: #444;
+            border-radius: 24px;
+            transition: 0.3s;
+        }
+
+        .slider:before {
+            content: '';
+            position: absolute;
+            width: 18px;
+            height: 18px;
+            left: 3px;
+            bottom: 3px;
+            background: white;
+            border-radius: 50%;
+            transition: 0.3s;
+        }
+
+        input:checked+.slider {
+            background: var(--accent-primary);
+        }
+
+        input:checked+.slider:before {
+            transform: translateX(20px);
+        }
+
+        /* Quick Actions */
+        .quick-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        /* Logs Panel */
+        .logs-container {
+            height: 200px;
+            overflow-y: auto;
+            font-family: 'Consolas', monospace;
+            font-size: 0.8rem;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            padding: 10px;
+        }
+
+        .log-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 10px;
+        }
+
+        .log-time {
+            color: var(--text-secondary);
+        }
+
+        .log-success {
+            color: var(--accent-primary);
+        }
+
+        .log-error {
+            color: var(--accent-red);
+        }
+
+        .log-info {
+            color: var(--accent-blue);
+        }
+
+        /* API Key Input */
+        .api-key-row {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .api-key-row input {
+            flex: 1;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            padding: 10px 14px;
+            border-radius: 8px;
+            color: white;
+            font-size: 0.85rem;
+            outline: none;
+        }
+
+        /* Markdown Styles */
+        .prose pre {
+            background: #0a0a15;
+            padding: 12px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 10px 0;
+        }
+
+        .prose code {
+            font-family: 'Consolas', monospace;
+            font-size: 0.9em;
+        }
+
+        .prose p {
+            margin-bottom: 8px;
+        }
+
+        .prose p:last-child {
+            margin-bottom: 0;
+        }
+
+        .prose ul,
+        .prose ol {
+            padding-left: 20px;
+            margin: 8px 0;
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+    </style>
+</head>
+
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="logo">
+            <div class="logo-icon">⚡</div>
+            <div>
+                <h1>Nexus Control Center</h1>
+                <span>AI Gateway v1.0 • Free Tier Optimized</span>
+            </div>
+        </div>
+        <div class="header-controls">
+            <div class="status-badge">
+                <div class="status-dot" id="global-status"></div>
+                <span id="status-text">Connecting...</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="main-container">
+        <!-- Chat Panel -->
+        <div class="panel chat-panel">
+            <div class="panel-header">
+                <h2>💬 Chat Terminal</h2>
+                <select id="routing-mode"
+                    style="background: var(--bg-input); border: 1px solid var(--border); color: white; padding: 6px 12px; border-radius: 6px; font-size: 0.85rem;">
+                    <option value="smart">Smart Routing</option>
+                    <option value="fastest">Fastest</option>
+                    <option value="round-robin">Round Robin</option>
+                </select>
+            </div>
+            <div class="panel-content" id="chat-stream">
+                <div class="message assistant">
+                    <div class="bubble prose">
+                        Welcome to <strong>Nexus Control Center</strong>. Use the chat or quick actions to test your AI
+                        Gateway.
+                        <br><br>
+                        <strong>Commands:</strong><br>
+                        • <code>/sys info</code> - Full system status<br>
+                        • <code>/test stress</code> - Run stress test
+                    </div>
+                </div>
+            </div>
+            <div class="input-area">
+                <input type="text" id="user-input" placeholder="Type a message or command..." autocomplete="off">
+                <button class="btn" id="send-btn" onclick="sendMessage()">Send</button>
+            </div>
+        </div>
+
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <!-- API Key -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>🔐 Authentication</h2>
+                </div>
+                <div class="panel-content">
+                    <div class="api-key-row">
+                        <input type="password" id="api-key" placeholder="NEXUS_MASTER_KEY (optional)">
+                        <button class="btn btn-secondary btn-sm" onclick="testConnection()">Test</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Metrics -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>📊 Live Metrics</h2>
+                    <span style="font-size: 0.75rem; color: var(--text-secondary);" id="last-update">--</span>
+                </div>
+                <div class="panel-content">
+                    <div class="metrics-grid">
+                        <div class="metric-card">
+                            <div class="metric-value" id="metric-uptime">0s</div>
+                            <div class="metric-label">Uptime</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-value" id="metric-inflight">0</div>
+                            <div class="metric-label">In-Flight</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-value" id="metric-providers">0</div>
+                            <div class="metric-label">Providers</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-value" id="metric-health">--%</div>
+                            <div class="metric-label">Avg Health</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Quick Actions -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>🚀 Quick Actions</h2>
+                </div>
+                <div class="panel-content">
+                    <div class="quick-actions">
+                        <button class="btn btn-secondary btn-sm" onclick="quickTest()">🧪 Quick Test</button>
+                        <button class="btn btn-secondary btn-sm" onclick="stressTest()">⚡ Stress (3x)</button>
+                        <button class="btn btn-secondary btn-sm" onclick="benchmarkAll()">📈 Benchmark</button>
+                        <button class="btn btn-secondary btn-sm" onclick="showSystemInfo()">ℹ️ Sys Info</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Providers -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>🛡️ Active Providers</h2>
+                </div>
+                <div class="panel-content" id="providers-list" style="max-height: 300px; overflow-y: auto;">
+                    <div style="text-align: center; color: var(--text-secondary); padding: 20px;">Loading...</div>
+                </div>
+            </div>
+
+            <!-- Logs -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>📋 Activity Log</h2>
+                    <button class="btn btn-secondary btn-sm" onclick="clearLogs()">Clear</button>
+                </div>
+                <div class="panel-content">
+                    <div class="logs-container" id="logs-container">
+                        <div class="log-entry">
+                            <span class="log-time">--:--:--</span>
+                            <span class="log-info">Waiting for activity...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Always use localhost:3000 - works for both file:// and http:// protocols
+        const API_BASE = 'http://localhost:3000';
+
+        const chatStream = document.getElementById('chat-stream');
+        const userInput = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+        const routingMode = document.getElementById('routing-mode');
+        const apiKeyInput = document.getElementById('api-key');
+        const logsContainer = document.getElementById('logs-container');
+
+        // Initialize Marked
+        marked.setOptions({
+            highlight: (code, lang) => lang && hljs.getLanguage(lang)
+                ? hljs.highlight(code, { language: lang }).value
+                : hljs.highlightAuto(code).value
+        });
+
+        // Auth Headers
+        function getAuthHeaders() {
+            const headers = { 'Content-Type': 'application/json' };
+            const key = apiKeyInput.value.trim();
+            if (key) headers['Authorization'] = `Bearer ${key}`;
+            return headers;
+        }
+
+        // Logging
+        function addLog(message, type = 'info') {
+            const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-${type}">${message}</span>`;
+            logsContainer.insertBefore(entry, logsContainer.firstChild);
+            if (logsContainer.children.length > 50) logsContainer.lastChild.remove();
+        }
+
+        function clearLogs() {
+            logsContainer.innerHTML = '<div class="log-entry"><span class="log-time">--:--:--</span><span class="log-info">Logs cleared</span></div>';
+        }
+
+        // Dashboard Update
+        async function updateDashboard() {
+            try {
+                const res = await fetch(`${API_BASE}/health`);
+                const data = await res.json();
+
+                document.getElementById('global-status').classList.remove('error');
+                document.getElementById('status-text').textContent = data.status === 'healthy' ? 'Online' : data.status;
+
+                document.getElementById('metric-uptime').textContent = formatUptime(data.uptime);
+                document.getElementById('metric-inflight').textContent = data.inFlightRequests;
+                document.getElementById('metric-providers').textContent = data.providers?.length || 0;
+
+                const avgHealth = data.providers?.reduce((acc, p) => {
+                    const h = parseFloat(p.metrics?.healthScore) || 50;
+                    return acc + h;
+                }, 0) / (data.providers?.length || 1);
+                document.getElementById('metric-health').textContent = Math.round(avgHealth) + '%';
+
+                document.getElementById('last-update').textContent = new Date().toLocaleTimeString('en-US', { hour12: false });
+
+                renderProviders(data.providers || []);
+            } catch (e) {
+                document.getElementById('global-status').classList.add('error');
+                document.getElementById('status-text').textContent = 'Offline';
+            }
+        }
+
+        function formatUptime(sec) {
+            if (!sec) return '0s';
+            if (sec < 60) return Math.floor(sec) + 's';
+            if (sec < 3600) return Math.floor(sec / 60) + 'm';
+            return Math.floor(sec / 3600) + 'h';
+        }
+
+        function renderProviders(providers) {
+            const container = document.getElementById('providers-list');
+            if (!providers.length) {
+                container.innerHTML = '<div style="text-align: center; color: var(--text-secondary);">No providers</div>';
+                return;
+            }
+
+            container.innerHTML = providers.map(p => {
+                const health = parseFloat(p.metrics?.healthScore) || 50;
+                const healthClass = health >= 70 ? '' : health >= 40 ? 'warning' : 'error';
+                const icon = getProviderIcon(p.provider);
+                const stats = p.metrics || {};
+
+                return `
+                    <div class="provider-card">
+                        <div class="provider-header">
+                            <div class="provider-name">
+                                <div class="provider-icon ${p.provider}">${icon}</div>
+                                <span>${p.name}</span>
+                            </div>
+                            <label class="switch">
+                                <input type="checkbox" ${p.enabled !== false ? 'checked' : ''} 
+                                    onchange="toggleProvider('${p.name}', this.checked)">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <div class="health-bar"><div class="health-fill ${healthClass}" style="width: ${health}%"></div></div>
+                        <div class="provider-stats">
+                            <span>${stats.avgLatency || 0}ms avg</span>
+                            <span>${stats.successRate || 'N/A'}</span>
+                            <span>${p.circuitState}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function getProviderIcon(provider) {
+            const icons = { cerebras: '🧠', groq: '⚡', openrouter: '🌐', gemini: '💎' };
+            return icons[provider] || '🤖';
+        }
+
+        async function toggleProvider(name, enabled) {
+            try {
+                await fetch(`${API_BASE}/v1/providers/toggle`, {
+                    method: 'POST',
+                    headers: getAuthHeaders(),
+                    body: JSON.stringify({ name, enabled })
+                });
+                addLog(`Provider ${name} ${enabled ? 'enabled' : 'disabled'}`, 'success');
+                updateDashboard();
+            } catch (e) {
+                addLog(`Toggle failed: ${e.message}`, 'error');
+            }
+        }
+
+        // Chat Functions
+        function appendMessage(role, text, meta = {}) {
+            const div = document.createElement('div');
+            div.className = `message ${role}`;
+
+            const metaHtml = role === 'assistant' && meta.model ? `
+                <div class="message-meta">
+                    <span class="model-tag">${meta.model}</span>
+                    ${meta.latency ? `<span class="latency-tag">${meta.latency}ms</span>` : ''}
+                </div>
+            ` : '';
+
+            div.innerHTML = `${metaHtml}<div class="bubble prose"></div>`;
+            const bubble = div.querySelector('.bubble');
+
+            if (role === 'assistant') {
+                bubble.innerHTML = DOMPurify.sanitize(marked.parse(text));
+                bubble.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
+            } else {
+                bubble.textContent = text;
+            }
+
+            chatStream.appendChild(div);
+            chatStream.scrollTop = chatStream.scrollHeight;
+            return div;
+        }
+
+        async function sendMessage() {
+            const text = userInput.value.trim();
+            if (!text) return;
+
+            userInput.value = '';
+            sendBtn.disabled = true;
+            appendMessage('user', text);
+
+            // Handle commands
+            if (text.startsWith('/sys')) {
+                await showSystemInfo();
+                sendBtn.disabled = false;
+                return;
+            }
+            if (text.startsWith('/test')) {
+                await stressTest();
+                sendBtn.disabled = false;
+                return;
+            }
+
+            const startTime = Date.now();
+            let modelName = 'Routing...';
+
+            try {
+                addLog(`Sending: "${text.substring(0, 30)}..."`, 'info');
+
+                const response = await fetch(`${API_BASE}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: { ...getAuthHeaders(), 'X-Routing-Mode': routingMode.value },
+                    body: JSON.stringify({ messages: [{ role: 'user', content: text }], stream: true })
+                });
+
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let fullText = '';
+                let msgDiv = null;
+                let firstChunk = null;
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    if (!firstChunk) firstChunk = Date.now();
+                    const chunk = decoder.decode(value);
+
+                    for (const line of chunk.split('\n')) {
+                        if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                if (data.model) modelName = data.model;
+                                if (data.choices?.[0]?.delta?.content) {
+                                    fullText += data.choices[0].delta.content;
+                                    if (!msgDiv) {
+                                        msgDiv = appendMessage('assistant', fullText, { model: modelName, latency: firstChunk - startTime });
+                                    } else {
+                                        const bubble = msgDiv.querySelector('.bubble');
+                                        bubble.innerHTML = DOMPurify.sanitize(marked.parse(fullText));
+                                    }
+                                }
+                            } catch { }
+                        }
+                    }
+                }
+
+                addLog(`Response from ${modelName} (${Date.now() - startTime}ms)`, 'success');
+            } catch (err) {
+                appendMessage('assistant', `⚠️ **Error:** ${err.message}`);
+                addLog(`Error: ${err.message}`, 'error');
+            } finally {
+                sendBtn.disabled = false;
+                updateDashboard();
+            }
+        }
+
+        // Quick Actions
+        async function quickTest() {
+            addLog('Running quick test...', 'info');
+            userInput.value = 'Say "Hello from Nexus!" in exactly 5 words.';
+            await sendMessage();
+        }
+
+        async function stressTest() {
+            addLog('Starting stress test (3 requests)...', 'info');
+            appendMessage('assistant', '⚡ **Stress Test** - Running 3 sequential requests...');
+
+            const results = [];
+            for (let i = 0; i < 3; i++) {
+                const start = Date.now();
+                try {
+                    const res = await fetch(`${API_BASE}/v1/chat/completions`, {
+                        method: 'POST',
+                        headers: { ...getAuthHeaders(), 'X-Routing-Mode': routingMode.value },
+                        body: JSON.stringify({ messages: [{ role: 'user', content: `ping ${i + 1}` }], stream: false })
+                    });
+                    results.push({ run: i + 1, ok: res.ok, ms: Date.now() - start });
+                } catch (e) {
+                    results.push({ run: i + 1, ok: false, ms: Date.now() - start, error: e.message });
+                }
+            }
+
+            const summary = results.map(r => `Run ${r.run}: ${r.ok ? '✅' : '❌'} ${r.ms}ms`).join('\n');
+            const avg = Math.round(results.reduce((a, r) => a + r.ms, 0) / results.length);
+            appendMessage('assistant', `**Results:**\n\`\`\`\n${summary}\n\`\`\`\n**Avg:** ${avg}ms`, { model: 'Stress Test' });
+            addLog(`Stress test complete. Avg: ${avg}ms`, 'success');
+        }
+
+        async function benchmarkAll() {
+            addLog('Benchmarking all providers...', 'info');
+            appendMessage('assistant', '📈 **Benchmark** - Testing each provider individually...');
+            // This would require backend support for provider-specific routing
+            appendMessage('assistant', '⚠️ Provider-specific benchmark requires backend `/benchmark` endpoint (not implemented yet).', { model: 'System' });
+        }
+
+        async function showSystemInfo() {
+            try {
+                const res = await fetch(`${API_BASE}/health`);
+                const data = await res.json();
+                appendMessage('assistant', '```json\n' + JSON.stringify(data, null, 2) + '\n```', { model: '/sys info' });
+                addLog('System info retrieved', 'success');
+            } catch (e) {
+                appendMessage('assistant', `⚠️ Failed to get system info: ${e.message}`);
+                addLog('Sys info failed', 'error');
+            }
+        }
+
+        async function testConnection() {
+            addLog('Testing connection...', 'info');
+            try {
+                const res = await fetch(`${API_BASE}/health`, { headers: getAuthHeaders() });
+                if (res.ok) {
+                    addLog('Connection successful!', 'success');
+                    alert('✅ Connection successful!');
+                } else {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+            } catch (e) {
+                addLog(`Connection failed: ${e.message}`, 'error');
+                alert('❌ Connection failed: ' + e.message);
+            }
+        }
+
+        // Event Listeners
+        userInput.addEventListener('keypress', e => { if (e.key === 'Enter') sendMessage(); });
+
+        // Start
+        updateDashboard();
+        setInterval(updateDashboard, 3000);
+        addLog('Control Center initialized', 'success');
+    </script>
+</body>
+
+</html>

@@ -102,6 +102,7 @@ bun run start:prod
 | `GET` | `/health` | Health check with provider metrics |
 | `GET` | `/v1/models` | List available models |
 | `POST` | `/v1/chat/completions` | Chat completion (streaming) |
+| `POST` | `/v1/providers/toggle` | Enable/disable a provider instance |
 
 ### Chat Completion
 
@@ -110,6 +111,7 @@ bun run start:prod
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "X-Routing-Mode: smart" \
   -d '{
     "messages": [
       {"role": "system", "content": "You are a helpful assistant"},
@@ -161,6 +163,7 @@ curl http://localhost:3000/health
     {
       "name": "Groq (Key #1)",
       "circuitState": "CLOSED",
+      "enabled": true,
       "metrics": {
         "totalRequests": 150,
         "successRate": "98.0%",
@@ -170,6 +173,23 @@ curl http://localhost:3000/health
     }
   ]
 }
+
+---
+
+### Provider Toggle (Control Center)
+
+Enable/disable a specific provider instance by its `name` (as shown in `/health`).
+
+```bash
+curl -X POST http://localhost:3000/v1/providers/toggle \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Groq (Key #1)",
+    "enabled": false
+  }'
+```
+
+> **Security note:** if you expose this gateway publicly, protect this endpoint (token/auth + restricted CORS).
 ```
 
 ---
@@ -203,6 +223,16 @@ OPENROUTER_KEY_1=sk-or-v1-...
 # Cerebras (default: zai-glm-4.7)
 CEREBRAS_MODEL=zai-glm-4.7
 CEREBRAS_KEY_1=...
+
+### Routing Modes
+
+You can influence routing behavior per request via header:
+
+`X-Routing-Mode: smart | fastest | round-robin`
+
+- `smart` (default): weighted selection using health score + circuit breaker state
+- `fastest`: pick the highest-scored provider among available
+- `round-robin`: cycle through available providers (still respects `enabled` + circuit breaker)
 ```
 
 ### Available Models (2026)

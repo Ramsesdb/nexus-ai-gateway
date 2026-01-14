@@ -92,6 +92,7 @@ export interface ServiceMetrics {
 export interface TrackedService {
   service: AIService;
   metrics: ServiceMetrics;
+  enabled: boolean;
 }
 
 // --- UTILITY FUNCTIONS ---
