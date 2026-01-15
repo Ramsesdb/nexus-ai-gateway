@@ -687,17 +687,45 @@ const server = Bun.serve({
                     }
                   })();
 
+                  const emitMetadata = (service: AIService, latency: number, circuitState: string, health: number) => {
+                    const metadata = {
+                      type: 'nexus-metadata',
+                      metadata: {
+                        provider: service.name,
+                        latency: latency,
+                        circuit: circuitState,
+                        healthScore: Math.round(health * 100),
+                        requestId: requestId,
+                      }
+                    };
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`));
+                  };
+
                   if (aborted) break;
 
                   if (!firstResult.done && firstResult.value) {
                     started = true;
                     console.log(`[Router] Streaming started with: ${service.name}`);
+                    // Emit metadata before first chunk
+                    emitMetadata(
+                      service,
+                      Date.now() - startTime,
+                      tracked.circuitBreaker.state,
+                      calculateHealthScore(tracked)
+                    );
                     emitChunk(service, firstResult.value);
                   } else if (firstResult.done) {
                     started = true;
                     tracked.metrics.successCount++;
                     tracked.metrics.totalLatencyMs += Date.now() - startTime;
                     recordSuccess(tracked);
+                    // Emit metadata for non-streaming response too
+                    emitMetadata(
+                      service,
+                      Date.now() - startTime,
+                      tracked.circuitBreaker.state,
+                      calculateHealthScore(tracked)
+                    );
                     break;
                   }
 
@@ -707,6 +735,12 @@ const server = Bun.serve({
                       if (!started) {
                         started = true;
                         console.log(`[Router] Streaming started with: ${service.name}`);
+                        emitMetadata(
+                          service,
+                          Date.now() - startTime,
+                          tracked.circuitBreaker.state,
+                          calculateHealthScore(tracked)
+                        );
                       }
                       emitChunk(service, chunk);
                     }
