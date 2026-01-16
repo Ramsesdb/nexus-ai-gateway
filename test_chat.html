@@ -706,7 +706,9 @@
 
     <script>
         // Always use localhost:3000 - works for both file:// and http:// protocols
-        const API_BASE = 'http://localhost:3000';
+        // Default to Azure URL for ease of testing
+        const API_BASE = 'http://x8ck0g4gco4cwsswkks44k08.4.205.185.163.sslip.io';
+        // const API_BASE = 'http://localhost:3000';
 
         const chatStream = document.getElementById('chat-stream');
         const userInput = document.getElementById('user-input');
