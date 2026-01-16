@@ -6,6 +6,8 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue?logo=typescript)](https://typescriptlang.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
+> 🌐 **Live Demo:** [api.ramsesdb.tech](https://api.ramsesdb.tech/health)
+
 ---
 
 ## ✨ Features
@@ -66,7 +68,7 @@ graph TD
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/nexus-ai-gateway.git
+git clone https://github.com/ramsesdb/nexus-ai-gateway.git
 cd nexus-ai-gateway
 
 # Install dependencies
