@@ -108,13 +108,30 @@ export class GeminiService implements AIService {
                 : lastContent;
 
             const chat = this.model.startChat({ history });
+            const result = await chat.sendMessage(lastMessage);
+            const response = result.response;
+            const text = response.text();
 
-            const toolConfig = options.tools
-                ? { toolConfig: { functionDeclarations: options.tools } }
-                : undefined;
-
-            const result = await chat.sendMessage(lastMessage, toolConfig as never);
-            return result;
+            // Transform Gemini response to OpenAI-compatible format
+            return {
+                id: `chatcmpl-${crypto.randomUUID()}`,
+                object: 'chat.completion',
+                created: Math.floor(Date.now() / 1000),
+                model: this.name,
+                choices: [{
+                    index: 0,
+                    message: {
+                        role: 'assistant',
+                        content: text,
+                    },
+                    finish_reason: 'stop',
+                }],
+                usage: {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+            };
         } catch (error) {
             console.error(`[${this.name}] Error:`, error);
             throw error;
