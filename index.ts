@@ -417,6 +417,8 @@ console.log(`⚡ Circuit Breaker: ${CONFIG.circuitBreaker.failureThreshold} fail
 
 const server = Bun.serve({
   port: CONFIG.port,
+  // Increase idle timeout to allow long streaming responses
+  idleTimeout: Number(process.env.IDLE_TIMEOUT_SECONDS) || 120,
 
   async fetch(req) {
     // Reject new requests during shutdown
