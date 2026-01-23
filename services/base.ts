@@ -9,6 +9,7 @@ import type {
     ChatMessage,
     ProviderType,
     ServiceConfig,
+    ChatOptions,
     getTextContent
 } from '../types';
 
@@ -58,13 +59,14 @@ export abstract class BaseOpenAIService implements AIService {
      * Stream chat completion responses.
      * Common implementation for all OpenAI-compatible APIs.
      */
-    async *chat(messages: ChatMessage[]): AsyncGenerator<string, void, unknown> {
+    async *chat(messages: ChatMessage[], options: ChatOptions = {}): AsyncGenerator<string, void, unknown> {
         try {
             const completion = await this.client.chat.completions.create({
                 messages: this.formatMessages(messages),
-                model: this.model,
+                model: options.model || this.model,
                 stream: true,
                 ...this.extraParams,
+                ...options,
             });
 
             for await (const chunk of completion) {
@@ -73,6 +75,23 @@ export abstract class BaseOpenAIService implements AIService {
                     yield content;
                 }
             }
+        } catch (error) {
+            console.error(`[${this.name}] Error:`, error);
+            throw error;
+        }
+    }
+
+    async createChatCompletion(messages: ChatMessage[], options: ChatOptions = {}): Promise<unknown> {
+        try {
+            const completion = await this.client.chat.completions.create({
+                messages: this.formatMessages(messages),
+                model: options.model || this.model,
+                stream: false,
+                ...this.extraParams,
+                ...options,
+            });
+
+            return completion;
         } catch (error) {
             console.error(`[${this.name}] Error:`, error);
             throw error;

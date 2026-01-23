@@ -566,7 +566,19 @@ const server = Bun.serve({
       let hasDecrementedInFlight = false; // Prevent double decrement - declared here for catch scope
 
       try {
-        const body = await req.json() as { messages?: unknown };
+        const body = await req.json() as {
+          messages?: unknown;
+          stream?: boolean;
+          model?: string;
+          tools?: unknown;
+          tool_choice?: unknown;
+          temperature?: number;
+          top_p?: number;
+          max_tokens?: number;
+          presence_penalty?: number;
+          frequency_penalty?: number;
+          stop?: string | string[];
+        };
         const messages = body.messages;
 
         if (!Array.isArray(messages) || !messages.every(isValidMessage)) {
@@ -600,6 +612,81 @@ const server = Bun.serve({
 
         const onAbort = () => { aborted = true; };
         req.signal?.addEventListener?.('abort', onAbort, { once: true } as EventListenerOptions);
+
+        const streamRequested = body.stream !== false;
+        const chatOptions = {
+          model: body.model,
+          tools: body.tools,
+          tool_choice: body.tool_choice,
+          temperature: body.temperature,
+          top_p: body.top_p,
+          max_tokens: body.max_tokens,
+          presence_penalty: body.presence_penalty,
+          frequency_penalty: body.frequency_penalty,
+          stop: body.stop,
+        };
+
+        if (!streamRequested) {
+          const triedIndices = new Set<number>();
+          let attemptNumber = 0;
+
+          while (triedIndices.size < trackedServices.length) {
+            const tracked = getNextService(triedIndices, routingMode);
+            if (!tracked) break;
+
+            attemptNumber++;
+            const serviceIndex = trackedServices.indexOf(tracked);
+            triedIndices.add(serviceIndex);
+
+            if (attemptNumber > 1) {
+              const backoffDelay = calculateBackoffDelay(attemptNumber - 1);
+              await sleep(backoffDelay);
+            }
+
+            const service = tracked.service;
+            const startTime = Date.now();
+            tracked.metrics.totalRequests++;
+
+            try {
+              const completion = service.createChatCompletion
+                ? await service.createChatCompletion(typedMessages, chatOptions)
+                : await (async () => {
+                    // Fallback to streaming if provider lacks non-streaming
+                    let full = '';
+                    for await (const chunk of service.chat(typedMessages, chatOptions)) {
+                      full += chunk;
+                    }
+                    return {
+                      id: requestId,
+                      object: 'chat.completion',
+                      created,
+                      model: service.name,
+                      choices: [{ index: 0, message: { role: 'assistant', content: full }, finish_reason: 'stop' }],
+                    };
+                  })();
+
+              tracked.metrics.successCount++;
+              tracked.metrics.totalLatencyMs += Date.now() - startTime;
+              recordSuccess(tracked);
+
+              return new Response(JSON.stringify(completion), {
+                headers: { 'Content-Type': 'application/json', ...corsHeaders },
+              });
+            } catch (err) {
+              const errorMsg = err instanceof Error ? err.message : String(err);
+              tracked.metrics.failCount++;
+              tracked.metrics.lastError = errorMsg;
+              tracked.metrics.lastErrorTime = Date.now();
+              tracked.metrics.totalLatencyMs += Date.now() - startTime;
+              recordFailure(tracked);
+            }
+          }
+
+          return new Response(
+            JSON.stringify({ error: { message: 'All providers failed or circuits are open', type: 'gateway_error' } }),
+            { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
+          );
+        }
 
         const stream = new ReadableStream({
           async start(controller) {
@@ -665,7 +752,7 @@ const server = Bun.serve({
                 tracked.metrics.totalRequests++;
 
                 try {
-                  const gen = service.chat(typedMessages);
+                  const gen = service.chat(typedMessages, chatOptions);
 
                   // First-token timeout
                   const firstResult = await (async () => {

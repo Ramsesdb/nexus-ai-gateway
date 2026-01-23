@@ -56,12 +56,34 @@ export interface AIService {
    * @param messages - Array of chat messages
    * @yields String chunks of the response
    */
-  chat(messages: ChatMessage[]): AsyncGenerator<string, void, unknown>;
+  chat(messages: ChatMessage[], options?: ChatOptions): AsyncGenerator<string, void, unknown>;
+
+  /**
+   * Non-streaming completion for tool calls or JSON responses.
+   */
+  createChatCompletion?(messages: ChatMessage[], options?: ChatOptions): Promise<unknown>;
 }
 
 // --- PROVIDER TYPES ---
 
 export type ProviderType = 'groq' | 'gemini' | 'openrouter' | 'cerebras';
+
+/**
+ * Optional chat completion params (OpenAI-compatible subset)
+ */
+export interface ChatOptions {
+  model?: string;
+  stream?: boolean;
+  tools?: unknown;
+  tool_choice?: unknown;
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  presence_penalty?: number;
+  frequency_penalty?: number;
+  stop?: string | string[];
+  [key: string]: unknown;
+}
 
 /**
  * Configuration for a service instance

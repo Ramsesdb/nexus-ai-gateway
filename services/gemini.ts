@@ -4,7 +4,7 @@
  */
 
 import { GoogleGenerativeAI, type GenerativeModel, type Content } from '@google/generative-ai';
-import type { AIService, ChatMessage, ProviderType, MessageContent, getTextContent } from '../types';
+import type { AIService, ChatMessage, ProviderType, MessageContent, ChatOptions, getTextContent } from '../types';
 
 export class GeminiService implements AIService {
     private readonly model: GenerativeModel;
@@ -23,7 +23,7 @@ export class GeminiService implements AIService {
         this.name = `Gemini (Key #${instanceId})`;
     }
 
-    async *chat(messages: ChatMessage[]): AsyncGenerator<string, void, unknown> {
+    async *chat(messages: ChatMessage[], _options: ChatOptions = {}): AsyncGenerator<string, void, unknown> {
         try {
             if (!messages || messages.length === 0) {
                 throw new Error('Missing messages');
@@ -69,6 +69,52 @@ export class GeminiService implements AIService {
                     yield text;
                 }
             }
+        } catch (error) {
+            console.error(`[${this.name}] Error:`, error);
+            throw error;
+        }
+    }
+
+    async createChatCompletion(messages: ChatMessage[], options: ChatOptions = {}): Promise<unknown> {
+        try {
+            if (!messages || messages.length === 0) {
+                throw new Error('Missing messages');
+            }
+
+            const systemPrompt = messages
+                .filter(m => m.role === 'system')
+                .map(m => this.extractText(m.content))
+                .join('\n')
+                .trim();
+
+            const nonSystemMessages = messages.filter(m => m.role !== 'system');
+            if (nonSystemMessages.length === 0) {
+                throw new Error('Missing non-system messages');
+            }
+
+            const history: Content[] = nonSystemMessages.slice(0, -1).map(m => ({
+                role: m.role === 'user' ? 'user' : 'model',
+                parts: this.convertToParts(m.content),
+            }));
+
+            const lastMsg = nonSystemMessages[nonSystemMessages.length - 1];
+            if (!lastMsg) {
+                throw new Error('Missing last message');
+            }
+
+            const lastContent = this.extractText(lastMsg.content);
+            const lastMessage = systemPrompt
+                ? `System instructions:\n${systemPrompt}\n\n${lastContent}`
+                : lastContent;
+
+            const chat = this.model.startChat({ history });
+
+            const toolConfig = options.tools
+                ? { toolConfig: { functionDeclarations: options.tools } }
+                : undefined;
+
+            const result = await chat.sendMessage(lastMessage, toolConfig as never);
+            return result;
         } catch (error) {
             console.error(`[${this.name}] Error:`, error);
             throw error;
