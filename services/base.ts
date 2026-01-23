@@ -61,16 +61,19 @@ export abstract class BaseOpenAIService implements AIService {
      */
     async *chat(messages: ChatMessage[], options: ChatOptions = {}): AsyncGenerator<string, void, unknown> {
         try {
-            const completion = await this.client.chat.completions.create({
+            const { model, ...restOptions } = options;
+            const resolvedModel = model || this.model;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const completion = await (this.client.chat.completions.create as any)({
                 messages: this.formatMessages(messages),
-                model: options.model || this.model,
+                model: resolvedModel,
                 stream: true,
                 ...this.extraParams,
-                ...options,
+                ...restOptions,
             });
 
             for await (const chunk of completion) {
-                const content = chunk.choices[0]?.delta?.content;
+                const content = (chunk as any).choices[0]?.delta?.content;
                 if (content) {
                     yield content;
                 }
@@ -83,12 +86,15 @@ export abstract class BaseOpenAIService implements AIService {
 
     async createChatCompletion(messages: ChatMessage[], options: ChatOptions = {}): Promise<unknown> {
         try {
-            const completion = await this.client.chat.completions.create({
+            const { model, ...restOptions } = options;
+            const resolvedModel = model || this.model;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const completion = await (this.client.chat.completions.create as any)({
                 messages: this.formatMessages(messages),
-                model: options.model || this.model,
+                model: resolvedModel,
                 stream: false,
                 ...this.extraParams,
-                ...options,
+                ...restOptions,
             });
 
             return completion;
