@@ -690,6 +690,26 @@ const server = Bun.serve({
 
         const stream = new ReadableStream({
           async start(controller) {
+            let controllerClosed = false;
+            const safeEnqueue = (chunk: Uint8Array) => {
+              if (controllerClosed) return;
+              try {
+                controller.enqueue(chunk);
+              } catch {
+                controllerClosed = true;
+              }
+            };
+
+            const safeClose = () => {
+              if (controllerClosed) return;
+              controllerClosed = true;
+              try {
+                controller.close();
+              } catch {
+                // ignore
+              }
+            };
+
             try {
               let started = false;
               let attemptNumber = 0;
@@ -702,11 +722,11 @@ const server = Bun.serve({
                   model: service.name,
                   choices: [{ delta: { content }, index: 0, finish_reason: null }],
                 };
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
               };
 
               const emitError = (message: string) => {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message, type: 'gateway_error' } })}\n\n`));
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify({ error: { message, type: 'gateway_error' } })}\n\n`));
               };
 
               // Try each service with exponential backoff
@@ -785,7 +805,7 @@ const server = Bun.serve({
                         requestId: requestId,
                       }
                     };
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`));
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify(metadata)}\n\n`));
                   };
 
                   if (aborted) break;
@@ -857,14 +877,14 @@ const server = Bun.serve({
                 emitError('All providers failed or circuits are open');
               }
 
-              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-              controller.close();
+              safeEnqueue(encoder.encode('data: [DONE]\n\n'));
+              safeClose();
             } catch (err) {
               console.error('[Stream Error]', err);
               try {
-                controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                safeEnqueue(encoder.encode('data: [DONE]\n\n'));
               } catch { /* ignore */ }
-              controller.close();
+              safeClose();
             } finally {
               req.signal?.removeEventListener?.('abort', onAbort);
               decrementInFlight();
