@@ -288,6 +288,34 @@ const extractHttpStatus = (err: unknown): number | undefined => {
 };
 
 /**
+ * Best-effort extraction of an upstream error body for debug logging.
+ * Handles OpenAI SDK shapes (`err.error`, `err.response.data`) and plain strings.
+ * TEMP DEBUG: used to trace 400 "Invalid messages format" from providers.
+ */
+const extractErrorBody = (err: unknown): string => {
+  if (err === null || err === undefined) return '';
+  if (typeof err === 'string') return err;
+  if (typeof err !== 'object') return String(err);
+  const e = err as Record<string, unknown>;
+  const candidates: unknown[] = [
+    e.error,
+    (e.response as Record<string, unknown> | undefined)?.data,
+    (e.response as Record<string, unknown> | undefined)?.body,
+    e.body,
+    e.message,
+  ];
+  for (const c of candidates) {
+    if (c === undefined || c === null) continue;
+    if (typeof c === 'string' && c.length > 0) return c;
+    try {
+      const s = JSON.stringify(c);
+      if (s && s !== '{}') return s;
+    } catch { /* ignore */ }
+  }
+  try { return JSON.stringify(e); } catch { return String(err); }
+};
+
+/**
  * Extract Retry-After header (seconds) from an upstream error when available.
  */
 const extractRetryAfter = (err: unknown): number | undefined => {
@@ -647,6 +675,25 @@ const server = Bun.serve({
 
         let aborted = false;
         const triedIndices = new Set<number>();
+        // TEMP DEBUG: once-per-request flag to log provider 4xx details for the
+        // "Invalid messages format" investigation in the Wallex tool-use loop.
+        let debug4xxLogged = false;
+        const log4xxOnce = (serviceName: string, status: number, err: unknown, resolvedModel: string | undefined) => {
+          if (debug4xxLogged) return;
+          debug4xxLogged = true;
+          const errBody = extractErrorBody(err).slice(0, 500);
+          let msgs = '';
+          try { msgs = JSON.stringify(body.messages).slice(0, 2000); } catch { msgs = '<unserializable>'; }
+          const toolsCount = Array.isArray(body.tools) ? (body.tools as unknown[]).length : 0;
+          const toolChoice =
+            typeof body.tool_choice === 'string'
+              ? body.tool_choice
+              : body.tool_choice === undefined
+                ? '(none)'
+                : (() => { try { return JSON.stringify(body.tool_choice); } catch { return '<unserializable>'; } })();
+          console.warn(`[ProviderErrorBody] ${serviceName} status=${status} body=${errBody}`);
+          console.warn(`[IncomingRequest] messages=${msgs} tools_count=${toolsCount} tool_choice=${toolChoice} model=${resolvedModel ?? '(none)'}`);
+        };
 
         const decrementInFlight = () => {
           if (!hasDecrementedInFlight) {
@@ -764,6 +811,10 @@ const server = Bun.serve({
               } else if (status === 429) {
                 const retry = extractRetryAfter(err);
                 console.warn(`[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`);
+              }
+              // TEMP DEBUG: surface provider 4xx body + incoming request for repro
+              if (typeof status === 'number' && status >= 400 && status < 500) {
+                log4xxOnce(service.name, status, err, serviceOptions.model);
               }
               tracked.metrics.failCount++;
               tracked.metrics.lastError = errorMsg;
@@ -976,6 +1027,10 @@ const server = Bun.serve({
                   } else if (status === 429) {
                     const retry = extractRetryAfter(err);
                     console.warn(`[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`);
+                  }
+                  // TEMP DEBUG: surface provider 4xx body + incoming request for repro
+                  if (typeof status === 'number' && status >= 400 && status < 500) {
+                    log4xxOnce(service.name, status, err, streamOptions.model);
                   }
 
                   tracked.metrics.failCount++;
