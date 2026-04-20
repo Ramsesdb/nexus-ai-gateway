@@ -431,9 +431,18 @@ const isValidMessage = (m: unknown): m is ChatMessage => {
   if (!m || typeof m !== 'object') return false;
 
   const msg = m as Record<string, unknown>;
-  const validRoles = ['system', 'user', 'assistant'];
+  const validRoles = ['system', 'user', 'assistant', 'tool', 'function'];
 
   if (!validRoles.includes(msg.role as string)) return false;
+
+  // Allow null/undefined/empty content for assistant-with-tool_calls and tool/function role messages.
+  // OpenAI spec: assistant messages invoking tools may carry content: null; tool results have content as string but may be empty.
+  const isAssistantWithToolCalls =
+    msg.role === 'assistant' && Array.isArray(msg.tool_calls) && (msg.tool_calls as unknown[]).length > 0;
+  const isToolRole = msg.role === 'tool' || msg.role === 'function';
+  if ((isAssistantWithToolCalls || isToolRole) && (msg.content === null || msg.content === undefined || msg.content === '')) {
+    return true;
+  }
 
   if (typeof msg.content === 'string') return true;
 
@@ -654,11 +663,35 @@ const server = Bun.serve({
         };
         const messages = body.messages;
 
+        // TEMP DEBUG: unconditional request summary at handler entry to diagnose
+        // 400 "Invalid messages format" that never reaches provider-level logs.
+        try {
+          const msgArr = Array.isArray(messages) ? messages as any[] : undefined;
+          const summary = JSON.stringify({
+            model: body.model,
+            messages_count: msgArr?.length,
+            last_message: msgArr?.[msgArr.length - 1],
+            messages_summary: msgArr?.map((m: any) => ({
+              role: m?.role,
+              content_type: Array.isArray(m?.content) ? 'array' : typeof m?.content,
+              has_tool_calls: !!m?.tool_calls,
+              tool_call_id: m?.tool_call_id,
+            })),
+            tools_count: Array.isArray(body.tools) ? (body.tools as unknown[]).length : undefined,
+            tool_choice: body.tool_choice,
+          });
+          console.warn('[IncomingRequest-Start]', summary.slice(0, 2500));
+        } catch (logErr) {
+          console.warn('[IncomingRequest-Start] <serialize-failed>', logErr);
+        }
+
         if (!Array.isArray(messages) || !messages.every(isValidMessage)) {
           inFlightRequests--;
           hasDecrementedInFlight = true;
+          const errorBody = JSON.stringify({ error: { message: 'Invalid messages format', type: 'invalid_request_error' } });
+          console.warn('[GatewayReturningError]', 400, errorBody);
           return new Response(
-            JSON.stringify({ error: { message: 'Invalid messages format', type: 'invalid_request_error' } }),
+            errorBody,
             { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
           );
         }
@@ -733,14 +766,16 @@ const server = Bun.serve({
           inFlightRequests--;
           hasDecrementedInFlight = true;
           const supported = [...configuredProviders].join(', ');
+          const noCompatBody = JSON.stringify({
+            error: {
+              message: `No compatible provider is configured for model '${body.model}'. Available providers: ${supported}.`,
+              type: 'invalid_request_error',
+              param: 'model',
+            },
+          });
+          console.warn('[GatewayReturningError]', 400, noCompatBody);
           return new Response(
-            JSON.stringify({
-              error: {
-                message: `No compatible provider is configured for model '${body.model}'. Available providers: ${supported}.`,
-                type: 'invalid_request_error',
-                param: 'model',
-              },
-            }),
+            noCompatBody,
             { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
           );
         }
@@ -812,8 +847,8 @@ const server = Bun.serve({
                 const retry = extractRetryAfter(err);
                 console.warn(`[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`);
               }
-              // TEMP DEBUG: surface provider 4xx body + incoming request for repro
-              if (typeof status === 'number' && status >= 400 && status < 500) {
+              // TEMP DEBUG: surface provider bad-status body + incoming request for repro (4xx and 5xx).
+              if (typeof status === 'number' && status >= 400) {
                 log4xxOnce(service.name, status, err, serviceOptions.model);
               }
               tracked.metrics.failCount++;
@@ -824,15 +859,17 @@ const server = Bun.serve({
             }
           }
 
+          const gatewayErrorBody = JSON.stringify({
+            error: {
+              message: route.isUniversal
+                ? 'All providers failed or circuits are open'
+                : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`,
+              type: 'gateway_error',
+            },
+          });
+          console.warn('[GatewayReturningError]', 502, gatewayErrorBody);
           return new Response(
-            JSON.stringify({
-              error: {
-                message: route.isUniversal
-                  ? 'All providers failed or circuits are open'
-                  : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`,
-                type: 'gateway_error',
-              },
-            }),
+            gatewayErrorBody,
             { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
           );
         }
@@ -1028,8 +1065,8 @@ const server = Bun.serve({
                     const retry = extractRetryAfter(err);
                     console.warn(`[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`);
                   }
-                  // TEMP DEBUG: surface provider 4xx body + incoming request for repro
-                  if (typeof status === 'number' && status >= 400 && status < 500) {
+                  // TEMP DEBUG: surface provider bad-status body + incoming request for repro (4xx and 5xx).
+                  if (typeof status === 'number' && status >= 400) {
                     log4xxOnce(service.name, status, err, streamOptions.model);
                   }
 
@@ -1044,11 +1081,11 @@ const server = Bun.serve({
               }
 
               if (!started && !aborted) {
-                emitError(
-                  route.isUniversal
-                    ? 'All providers failed or circuits are open'
-                    : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`
-                );
+                const streamErrMsg = route.isUniversal
+                  ? 'All providers failed or circuits are open'
+                  : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`;
+                console.warn('[GatewayReturningError]', 'stream', streamErrMsg);
+                emitError(streamErrMsg);
               }
 
               safeEnqueue(encoder.encode('data: [DONE]\n\n'));
@@ -1086,8 +1123,10 @@ const server = Bun.serve({
           inFlightRequests--;
         }
         console.error('Internal Server Error:', error);
+        const internalBody = JSON.stringify({ error: { message: 'Internal Error', type: 'internal_error' } });
+        console.warn('[GatewayReturningError]', 500, internalBody);
         return new Response(
-          JSON.stringify({ error: { message: 'Internal Error', type: 'internal_error' } }),
+          internalBody,
           { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
         );
       }
