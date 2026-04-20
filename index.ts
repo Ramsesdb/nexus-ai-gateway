@@ -7,6 +7,7 @@ import { GroqService } from './services/groq';
 import { GeminiService } from './services/gemini';
 import { OpenRouterService } from './services/openrouter';
 import { CerebrasService } from './services/cerebras';
+import { resolveRoute, type ResolvedRoute } from './services/router';
 import type {
   AIService,
   ChatMessage,
@@ -269,6 +270,39 @@ const calculateBackoffDelay = (attempt: number): number => {
  */
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
+/**
+ * Best-effort HTTP status extraction for upstream errors.
+ * Covers the OpenAI SDK (`err.status`), fetch Response errors (`err.response.status`),
+ * and string fallbacks like "404 The model ... does not exist".
+ */
+const extractHttpStatus = (err: unknown): number | undefined => {
+  if (!err || typeof err !== 'object') return undefined;
+  const e = err as Record<string, unknown>;
+  if (typeof e.status === 'number') return e.status;
+  if (typeof e.statusCode === 'number') return e.statusCode;
+  const resp = e.response as Record<string, unknown> | undefined;
+  if (resp && typeof resp.status === 'number') return resp.status;
+  const msg = (e.message as string | undefined) || '';
+  const match = msg.match(/\b(4\d{2}|5\d{2})\b/);
+  return match?.[1] ? Number(match[1]) : undefined;
+};
+
+/**
+ * Extract Retry-After header (seconds) from an upstream error when available.
+ */
+const extractRetryAfter = (err: unknown): number | undefined => {
+  if (!err || typeof err !== 'object') return undefined;
+  const e = err as Record<string, unknown>;
+  const headers =
+    (e.headers as Record<string, string> | undefined)
+    ?? ((e.response as Record<string, unknown> | undefined)?.headers as Record<string, string> | undefined);
+  if (!headers) return undefined;
+  const raw = headers['retry-after'] ?? headers['Retry-After'];
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
+};
+
 // --- 7. HEALTH-AWARE LOAD BALANCER ---
 
 const calculateHealthScore = (tracked: EnhancedTrackedService): number => {
@@ -311,15 +345,24 @@ const calculateHealthScore = (tracked: EnhancedTrackedService): number => {
 };
 
 /**
- * Select next available service, respecting circuit breaker state and enabled status
+ * Select next available service, respecting circuit breaker state and enabled status.
+ * When `allowedProviders` is provided, only services whose provider is in the set
+ * are considered. This enforces model-capability routing.
  */
 const getNextService = (
   excludeIndices: Set<number>,
-  routingMode: 'smart' | 'fastest' | 'round-robin' = 'smart'
+  routingMode: 'smart' | 'fastest' | 'round-robin' = 'smart',
+  allowedProviders?: ReadonlySet<ProviderType>,
 ): EnhancedTrackedService | null => {
   const available = trackedServices
     .map((ts, index) => ({ ts, index }))
-    .filter(({ ts, index }) => !excludeIndices.has(index) && ts.enabled && isServiceAvailable(ts)); // Filter out disabled services
+    .filter(({ ts, index }) => {
+      if (excludeIndices.has(index)) return false;
+      if (!ts.enabled) return false;
+      if (!isServiceAvailable(ts)) return false;
+      if (allowedProviders && !allowedProviders.has(ts.service.provider)) return false;
+      return true;
+    });
 
   if (available.length === 0) return null;
   if (available.length === 1) return available[0]!.ts;
@@ -628,12 +671,38 @@ const server = Bun.serve({
           stop: body.stop,
         };
 
+        const route: ResolvedRoute = resolveRoute(body.model);
+        const allowedProviders = route.providers;
+        const configuredProviders = new Set(trackedServices.map(ts => ts.service.provider));
+        const compatibleProviders = [...allowedProviders].filter(p => configuredProviders.has(p));
+        const candidateList = trackedServices
+          .filter(ts => allowedProviders.has(ts.service.provider))
+          .map(ts => ts.service.name);
+
+        console.log(`[Router] model=${body.model || '(default)'} rule=${route.ruleLabel} candidates=[${candidateList.join(', ') || 'none'}]`);
+
+        if (compatibleProviders.length === 0) {
+          inFlightRequests--;
+          hasDecrementedInFlight = true;
+          const supported = [...configuredProviders].join(', ');
+          return new Response(
+            JSON.stringify({
+              error: {
+                message: `No compatible provider is configured for model '${body.model}'. Available providers: ${supported}.`,
+                type: 'invalid_request_error',
+                param: 'model',
+              },
+            }),
+            { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+          );
+        }
+
         if (!streamRequested) {
           const triedIndices = new Set<number>();
           let attemptNumber = 0;
 
           while (triedIndices.size < trackedServices.length) {
-            const tracked = getNextService(triedIndices, routingMode);
+            const tracked = getNextService(triedIndices, routingMode, allowedProviders);
             if (!tracked) break;
 
             attemptNumber++;
@@ -676,6 +745,15 @@ const server = Bun.serve({
               });
             } catch (err) {
               const errorMsg = err instanceof Error ? err.message : String(err);
+              const status = extractHttpStatus(err);
+              if (status === 404) {
+                console.error(`[Router] 404 from ${service.name} for model='${body.model}'. Provider misconfigured for this model; skipping.`);
+              } else if (status === 402) {
+                console.warn(`[Router] 402 insufficient credits on ${service.name}; moving to next compatible key.`);
+              } else if (status === 429) {
+                const retry = extractRetryAfter(err);
+                console.warn(`[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`);
+              }
               tracked.metrics.failCount++;
               tracked.metrics.lastError = errorMsg;
               tracked.metrics.lastErrorTime = Date.now();
@@ -685,7 +763,14 @@ const server = Bun.serve({
           }
 
           return new Response(
-            JSON.stringify({ error: { message: 'All providers failed or circuits are open', type: 'gateway_error' } }),
+            JSON.stringify({
+              error: {
+                message: route.isUniversal
+                  ? 'All providers failed or circuits are open'
+                  : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`,
+                type: 'gateway_error',
+              },
+            }),
             { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
           );
         }
@@ -733,7 +818,7 @@ const server = Bun.serve({
 
               // Try each service with exponential backoff
               while (triedIndices.size < trackedServices.length && !aborted) {
-                const tracked = getNextService(triedIndices, routingMode);
+                const tracked = getNextService(triedIndices, routingMode, allowedProviders);
                 if (!tracked) {
                   // All circuits might be open - wait and check again
                   if (attemptNumber > 0) {
@@ -741,9 +826,11 @@ const server = Bun.serve({
                     console.log(`[Router] All available circuits tried. Waiting ${backoffDelay}ms before checking again...`);
                     await sleep(backoffDelay);
 
-                    // Check if any circuit has reopened
+                    // Check if any circuit has reopened among compatible providers
                     const reopened = trackedServices.some((ts, idx) =>
-                      !triedIndices.has(idx) && isServiceAvailable(ts)
+                      !triedIndices.has(idx)
+                      && allowedProviders.has(ts.service.provider)
+                      && isServiceAvailable(ts)
                     );
                     if (!reopened) break;
                     continue;
@@ -863,7 +950,16 @@ const server = Bun.serve({
                   }
                 } catch (err) {
                   const errorMsg = err instanceof Error ? err.message : String(err);
-                  console.error(`[Provider Error] ${service.name}:`, errorMsg);
+                  const status = extractHttpStatus(err);
+                  console.error(`[Provider Error] ${service.name} status=${status ?? 'n/a'}:`, errorMsg);
+                  if (status === 404) {
+                    console.error(`[Router] 404 from ${service.name} for model='${body.model}'. Provider misconfigured for this model; skipping.`);
+                  } else if (status === 402) {
+                    console.warn(`[Router] 402 insufficient credits on ${service.name}; moving to next compatible key.`);
+                  } else if (status === 429) {
+                    const retry = extractRetryAfter(err);
+                    console.warn(`[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`);
+                  }
 
                   tracked.metrics.failCount++;
                   tracked.metrics.lastError = errorMsg;
@@ -876,7 +972,11 @@ const server = Bun.serve({
               }
 
               if (!started && !aborted) {
-                emitError('All providers failed or circuits are open');
+                emitError(
+                  route.isUniversal
+                    ? 'All providers failed or circuits are open'
+                    : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`
+                );
               }
 
               safeEnqueue(encoder.encode('data: [DONE]\n\n'));
