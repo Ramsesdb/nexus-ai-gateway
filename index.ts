@@ -673,6 +673,7 @@ const server = Bun.serve({
 
         const route: ResolvedRoute = resolveRoute(body.model);
         const allowedProviders = route.providers;
+        const modelAliases = route.modelAliases;
         const configuredProviders = new Set(trackedServices.map(ts => ts.service.provider));
         const compatibleProviders = [...allowedProviders].filter(p => configuredProviders.has(p));
         const candidateList = trackedServices
@@ -703,7 +704,12 @@ const server = Bun.serve({
 
           while (triedIndices.size < trackedServices.length) {
             const tracked = getNextService(triedIndices, routingMode, allowedProviders);
-            if (!tracked) break;
+            if (!tracked) {
+              if (attemptNumber === 0) {
+                console.warn(`[Router] All candidates circuit-OPEN for rule=${route.ruleLabel}, model=${body.model ?? '(default)'}`);
+              }
+              break;
+            }
 
             attemptNumber++;
             const serviceIndex = trackedServices.indexOf(tracked);
@@ -718,13 +724,18 @@ const server = Bun.serve({
             const startTime = Date.now();
             tracked.metrics.totalRequests++;
 
+            // Apply per-provider model alias when the original model string is
+            // incompatible with this provider (e.g. "openai/gpt-4.1-mini" -> Groq).
+            const alias = modelAliases[service.provider];
+            const serviceOptions = alias ? { ...chatOptions, model: alias } : chatOptions;
+
             try {
               const completion = service.createChatCompletion
-                ? await service.createChatCompletion(typedMessages, chatOptions)
+                ? await service.createChatCompletion(typedMessages, serviceOptions)
                 : await (async () => {
                     // Fallback to streaming if provider lacks non-streaming
                     let full = '';
-                    for await (const chunk of service.chat(typedMessages, chatOptions)) {
+                    for await (const chunk of service.chat(typedMessages, serviceOptions)) {
                       full += chunk;
                     }
                     return {
@@ -835,6 +846,7 @@ const server = Bun.serve({
                     if (!reopened) break;
                     continue;
                   }
+                  console.warn(`[Router] All candidates circuit-OPEN for rule=${route.ruleLabel}, model=${body.model ?? '(default)'}`);
                   break;
                 }
 
@@ -852,6 +864,11 @@ const server = Bun.serve({
                 const service = tracked.service;
                 const startTime = Date.now();
 
+                // Apply per-provider model alias when the original model string is
+                // incompatible with this provider (e.g. "openai/gpt-4.1-mini" -> Groq).
+                const streamAlias = modelAliases[service.provider];
+                const streamOptions = streamAlias ? { ...chatOptions, model: streamAlias } : chatOptions;
+
                 // Track half-open attempts
                 if (tracked.circuitBreaker.state === 'HALF_OPEN') {
                   tracked.circuitBreaker.halfOpenAttempts++;
@@ -861,7 +878,7 @@ const server = Bun.serve({
                 tracked.metrics.totalRequests++;
 
                 try {
-                  const gen = service.chat(typedMessages, chatOptions);
+                  const gen = service.chat(typedMessages, streamOptions);
 
                   // First-token timeout
                   const firstResult = await (async () => {

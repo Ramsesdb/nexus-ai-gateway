@@ -19,14 +19,33 @@ type PrefixRule = {
   test: (model: string) => boolean;
   providers: ProviderType[];
   label: string;
+  /**
+   * Per-provider model alias: when a fallback provider receives a model string
+   * it cannot understand (e.g. "openai/gpt-4.1-mini" sent to Groq), remap it
+   * to a native model that supports the same capabilities.
+   * Keys are ProviderType values; absence means "use the model string as-is".
+   */
+  modelAliases?: Partial<Record<ProviderType, string>>;
 };
 
 const starts = (prefix: string) => (m: string) => m.startsWith(prefix);
 
 const RULES: PrefixRule[] = [
-  // OpenAI family -> OpenRouter proxies OpenAI; native OpenAI provider is not wired
-  { label: 'openai/*',      test: starts('openai/'),      providers: ['openrouter'] },
-  { label: 'gpt-*',         test: starts('gpt-'),         providers: ['openrouter'] },
+  // OpenAI family -> OpenRouter first, then Gemini + Groq as circuit-breaker fallbacks.
+  // Gemini ignores options.model (uses GEMINI_MODEL env), so no alias needed there.
+  // Groq would 400 on "openai/*" / "gpt-*" strings, so alias to a capable Groq model.
+  {
+    label: 'openai/*',
+    test: starts('openai/'),
+    providers: ['openrouter', 'gemini', 'groq'],
+    modelAliases: { groq: 'llama-3.3-70b-versatile' },
+  },
+  {
+    label: 'gpt-*',
+    test: starts('gpt-'),
+    providers: ['openrouter', 'gemini', 'groq'],
+    modelAliases: { groq: 'llama-3.3-70b-versatile' },
+  },
   { label: 'o1-*',          test: starts('o1-'),          providers: ['openrouter'] },
   { label: 'o3-*',          test: starts('o3-'),          providers: ['openrouter'] },
   { label: 'o4-*',          test: starts('o4-'),          providers: ['openrouter'] },
@@ -69,6 +88,12 @@ export interface ResolvedRoute {
   isUniversal: boolean;
   /** Human-readable rule label used for logging */
   ruleLabel: string;
+  /**
+   * Per-provider model alias map (may be empty).
+   * When the original model string is incompatible with a fallback provider,
+   * use the alias instead of forwarding the original string.
+   */
+  modelAliases: Partial<Record<ProviderType, string>>;
 }
 
 const ALL_PROVIDERS: ProviderType[] = ['groq', 'gemini', 'openrouter', 'cerebras'];
@@ -85,6 +110,7 @@ export function resolveRoute(model?: string): ResolvedRoute {
       providers: new Set(ALL_PROVIDERS),
       isUniversal: true,
       ruleLabel: 'no-model (universal)',
+      modelAliases: {},
     };
   }
 
@@ -95,6 +121,7 @@ export function resolveRoute(model?: string): ResolvedRoute {
         providers: new Set(rule.providers),
         isUniversal: false,
         ruleLabel: rule.label,
+        modelAliases: rule.modelAliases ?? {},
       };
     }
   }
@@ -104,6 +131,7 @@ export function resolveRoute(model?: string): ResolvedRoute {
     providers: new Set(ALL_PROVIDERS),
     isUniversal: true,
     ruleLabel: 'unrecognized (fallback to all)',
+    modelAliases: {},
   };
 }
 
