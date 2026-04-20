@@ -1,206 +1,74 @@
 /**
- * Gemini Service - Google's thinking model with enhanced reasoning
- * Model configurable via GEMINI_MODEL env var
+ * Gemini Service - Google models via OpenAI-compatible endpoint.
+ * Uses the OpenAI SDK pointed at Google's generativelanguage endpoint.
+ * Model configurable via GEMINI_MODEL env var.
+ *
+ * NOTE: Google's OpenAI-compat layer has a known bug with streaming + tools
+ * (tool_calls deltas are malformed / dropped). The `chat()` override below
+ * falls back to a non-streaming call and re-emits the result as a synthetic
+ * single-chunk stream whenever tools are present.
  */
 
-import { GoogleGenerativeAI, type GenerativeModel, type Content } from '@google/generative-ai';
-import type { AIService, ChatMessage, ProviderType, MessageContent, ChatOptions, getTextContent } from '../types';
+import OpenAI from 'openai';
+import { BaseOpenAIService } from './base';
+import type { ChatMessage, ChatOptions } from '../types';
 
-export class GeminiService implements AIService {
-    private readonly model: GenerativeModel;
-    public readonly name: string;
-    public readonly provider: ProviderType = 'gemini';
-
-    constructor(apiKey: string, instanceId: string = '1') {
-        if (!apiKey) {
-            throw new Error('Gemini API key is required');
-        }
-
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-
-        this.model = genAI.getGenerativeModel({ model: modelName });
-        this.name = `Gemini (Key #${instanceId})`;
+export class GeminiService extends BaseOpenAIService {
+  constructor(apiKey: string, instanceId: string = '1') {
+    if (!apiKey) {
+      throw new Error('Gemini API key is required');
     }
 
-    async *chat(messages: ChatMessage[], _options: ChatOptions = {}): AsyncGenerator<string, void, unknown> {
-        try {
-            if (!messages || messages.length === 0) {
-                throw new Error('Missing messages');
-            }
+    super({
+      provider: 'gemini',
+      displayName: 'Gemini',
+      apiKey,
+      instanceId,
+      baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+      defaultModel: 'gemini-2.5-flash',
+      modelEnvVar: 'GEMINI_MODEL',
+    });
+  }
 
-            // Extract system prompt
-            const systemPrompt = messages
-                .filter(m => m.role === 'system')
-                .map(m => this.extractText(m.content))
-                .join('\n')
-                .trim();
+  /**
+   * Gemini's OpenAI-compat endpoint mishandles streaming when tools are
+   * provided. When tools are requested, perform a non-streaming call and
+   * re-emit as a synthetic stream (single content chunk, then a finish chunk).
+   * Otherwise, delegate to the base streaming implementation.
+   */
+  override async *chat(
+    messages: ChatMessage[],
+    options: ChatOptions = {}
+  ): AsyncGenerator<string, void, unknown> {
+    const hasTools = Array.isArray(options.tools) && (options.tools as unknown[]).length > 0;
 
-            // Get non-system messages
-            const nonSystemMessages = messages.filter(m => m.role !== 'system');
-            if (nonSystemMessages.length === 0) {
-                throw new Error('Missing non-system messages');
-            }
-
-            // Convert to Gemini format
-            const rawHistory: Content[] = nonSystemMessages.slice(0, -1).map(m => {
-                const role = m.role as string;
-                const isToolLike = role === 'tool' || role === 'function';
-                return {
-                    role: role === 'user' || isToolLike ? 'user' : 'model',
-                    parts: isToolLike
-                        ? [{ text: `Tool result: ${this.extractText(m.content)}` }]
-                        : this.convertToParts(m.content),
-                };
-            });
-
-            // Gemini requires history to start with role 'user'. Drop leading non-user entries.
-            const firstUserIdx = rawHistory.findIndex(c => c.role === 'user');
-            const history: Content[] = firstUserIdx === -1 ? [] : rawHistory.slice(firstUserIdx);
-
-            // Prepare last message with system prompt
-            const lastMsg = nonSystemMessages[nonSystemMessages.length - 1];
-            if (!lastMsg) {
-                throw new Error('Missing last message');
-            }
-
-            const lastContent = this.extractText(lastMsg.content);
-            const lastMessage = systemPrompt
-                ? `System instructions:\n${systemPrompt}\n\n${lastContent}`
-                : lastContent;
-
-            // Stream response
-            const chat = this.model.startChat({ history });
-            const result = await chat.sendMessageStream(lastMessage);
-
-            for await (const chunk of result.stream) {
-                const text = chunk.text();
-                if (text) {
-                    yield text;
-                }
-            }
-        } catch (error) {
-            console.error(`[${this.name}] Error:`, error);
-            throw error;
-        }
+    if (!hasTools) {
+      yield* super.chat(messages, options);
+      return;
     }
 
-    async createChatCompletion(messages: ChatMessage[], options: ChatOptions = {}): Promise<unknown> {
-        try {
-            if (!messages || messages.length === 0) {
-                throw new Error('Missing messages');
-            }
-
-            const systemPrompt = messages
-                .filter(m => m.role === 'system')
-                .map(m => this.extractText(m.content))
-                .join('\n')
-                .trim();
-
-            const nonSystemMessages = messages.filter(m => m.role !== 'system');
-            if (nonSystemMessages.length === 0) {
-                throw new Error('Missing non-system messages');
-            }
-
-            const rawHistory: Content[] = nonSystemMessages.slice(0, -1).map(m => {
-                const role = m.role as string;
-                const isToolLike = role === 'tool' || role === 'function';
-                return {
-                    role: role === 'user' || isToolLike ? 'user' : 'model',
-                    parts: isToolLike
-                        ? [{ text: `Tool result: ${this.extractText(m.content)}` }]
-                        : this.convertToParts(m.content),
-                };
-            });
-
-            // Gemini requires history to start with role 'user'. Drop leading non-user entries.
-            const firstUserIdx = rawHistory.findIndex(c => c.role === 'user');
-            const history: Content[] = firstUserIdx === -1 ? [] : rawHistory.slice(firstUserIdx);
-
-            const lastMsg = nonSystemMessages[nonSystemMessages.length - 1];
-            if (!lastMsg) {
-                throw new Error('Missing last message');
-            }
-
-            const lastContent = this.extractText(lastMsg.content);
-            const lastMessage = systemPrompt
-                ? `System instructions:\n${systemPrompt}\n\n${lastContent}`
-                : lastContent;
-
-            const chat = this.model.startChat({ history });
-            const result = await chat.sendMessage(lastMessage);
-            const response = result.response;
-            const text = response.text();
-
-            // Transform Gemini response to OpenAI-compatible format
-            return {
-                id: `chatcmpl-${crypto.randomUUID()}`,
-                object: 'chat.completion',
-                created: Math.floor(Date.now() / 1000),
-                model: this.name,
-                choices: [{
-                    index: 0,
-                    message: {
-                        role: 'assistant',
-                        content: text,
-                    },
-                    finish_reason: 'stop',
-                }],
-                usage: {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                },
-            };
-        } catch (error) {
-            console.error(`[${this.name}] Error:`, error);
-            throw error;
-        }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const completion = (await this.createChatCompletion(messages, options)) as any;
+      const choice = completion?.choices?.[0];
+      const content: string | undefined = choice?.message?.content;
+      if (content) {
+        yield content;
+      }
+    } catch (error) {
+      console.error(`[${this.name}] Error:`, error);
+      throw error;
     }
+  }
 
-    /**
-     * Extract text from message content (handles both string and multimodal)
-     */
-    private extractText(content: MessageContent): string {
-        if (typeof content === 'string') {
-            return content;
-        }
-        return content
-            .filter(part => part.type === 'text')
-            .map(part => (part as { type: 'text'; text: string }).text)
-            .join('\n');
-    }
-
-    /**
-     * Convert message content to Gemini Parts format
-     */
-    private convertToParts(content: MessageContent): Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> {
-        if (typeof content === 'string') {
-            return [{ text: content }];
-        }
-
-        return content.map(part => {
-            if (part.type === 'text') {
-                return { text: part.text };
-            }
-
-            // Convert image URL to inline data for Gemini
-            const url = part.image_url.url;
-            if (url.startsWith('data:')) {
-                // Extract base64 data from data URL
-                const matches = url.match(/^data:(.+);base64,(.+)$/);
-                if (matches) {
-                    return {
-                        inlineData: {
-                            mimeType: matches[1]!,
-                            data: matches[2]!,
-                        },
-                    };
-                }
-            }
-
-            // For HTTP URLs, Gemini requires conversion - for now, just use text description
-            return { text: `[Image: ${url}]` };
-        });
-    }
+  /**
+   * Gemini accepts OpenAI-style multimodal content (text + image_url parts)
+   * on the compat endpoint, so the default formatter from BaseOpenAIService
+   * is sufficient. Override left as hook point in case Google diverges later.
+   */
+  protected override formatMessages(
+    messages: ChatMessage[]
+  ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+    return super.formatMessages(messages);
+  }
 }

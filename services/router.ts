@@ -30,6 +30,9 @@ type PrefixRule = {
 
 const starts = (prefix: string) => (m: string) => m.startsWith(prefix);
 
+const GROQ_TOOL_MODEL = process.env.ROUTER_GROQ_TOOL_MODEL || 'openai/gpt-oss-120b';
+const GEMINI_TOOL_MODEL = process.env.ROUTER_GEMINI_TOOL_MODEL || 'gemini-2.5-flash';
+
 const RULES: PrefixRule[] = [
   // OpenAI family -> OpenRouter first, then Gemini + Groq as circuit-breaker fallbacks.
   // Gemini ignores options.model (uses GEMINI_MODEL env), so no alias needed there.
@@ -38,13 +41,13 @@ const RULES: PrefixRule[] = [
     label: 'openai/*',
     test: starts('openai/'),
     providers: ['openrouter', 'gemini', 'groq'],
-    modelAliases: { groq: 'llama-3.3-70b-versatile' },
+    modelAliases: { groq: GROQ_TOOL_MODEL, gemini: GEMINI_TOOL_MODEL },
   },
   {
     label: 'gpt-*',
     test: starts('gpt-'),
     providers: ['openrouter', 'gemini', 'groq'],
-    modelAliases: { groq: 'llama-3.3-70b-versatile' },
+    modelAliases: { groq: GROQ_TOOL_MODEL, gemini: GEMINI_TOOL_MODEL },
   },
   { label: 'o1-*',          test: starts('o1-'),          providers: ['openrouter'] },
   { label: 'o3-*',          test: starts('o3-'),          providers: ['openrouter'] },
