@@ -106,16 +106,23 @@ export abstract class BaseOpenAIService implements AIService {
 
     /**
      * Format messages for the API.
+     * Preserves OpenAI tool-use fields (tool_call_id, tool_calls, name) which
+     * are required by providers to match tool results back to invocations.
      * Override in subclasses if special formatting is needed.
      */
     protected formatMessages(
         messages: ChatMessage[]
     ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
-        return messages.map(msg => ({
-            role: msg.role,
-            content: typeof msg.content === 'string'
-                ? msg.content
-                : msg.content.map(part => {
+        return messages.map(msg => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const m: any = { role: msg.role };
+
+            // Content: string, multimodal array, or null/undefined
+            // (null/undefined is valid for assistant messages with tool_calls).
+            if (typeof msg.content === 'string') {
+                m.content = msg.content;
+            } else if (Array.isArray(msg.content)) {
+                m.content = msg.content.map((part: any) => {
                     if (part.type === 'text') {
                         return { type: 'text' as const, text: part.text };
                     }
@@ -123,7 +130,19 @@ export abstract class BaseOpenAIService implements AIService {
                         type: 'image_url' as const,
                         image_url: part.image_url,
                     };
-                }),
-        })) as OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+                });
+            } else if (msg.content === null || msg.content === undefined) {
+                m.content = msg.content;
+            }
+
+            // Preserve tool-use related fields from the OpenAI spec.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const anyMsg = msg as any;
+            if (anyMsg.tool_call_id !== undefined) m.tool_call_id = anyMsg.tool_call_id;
+            if (anyMsg.tool_calls !== undefined) m.tool_calls = anyMsg.tool_calls;
+            if (anyMsg.name !== undefined) m.name = anyMsg.name;
+
+            return m;
+        }) as OpenAI.Chat.Completions.ChatCompletionMessageParam[];
     }
 }

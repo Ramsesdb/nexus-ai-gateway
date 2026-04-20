@@ -30,12 +30,30 @@ export interface ImageContentPart {
 export type MessageContent = string | Array<TextContentPart | ImageContentPart>;
 
 /**
+ * OpenAI-compatible tool call structure (emitted by assistant messages).
+ */
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+/**
  * Chat message structure (OpenAI-compatible)
- * Supports both simple text and multimodal content
+ * Supports both simple text and multimodal content, plus tool-use fields.
  */
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: MessageContent;
+  role: 'system' | 'user' | 'assistant' | 'tool' | 'function';
+  content: MessageContent | null;
+  /** Required for role=tool — links result to the assistant's tool_call. */
+  tool_call_id?: string;
+  /** Present on assistant messages that request tool execution. */
+  tool_calls?: ToolCall[];
+  /** Required for role=function; optional name for role=tool. */
+  name?: string;
 }
 
 // --- SERVICE INTERFACE ---
