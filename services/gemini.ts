@@ -43,10 +43,20 @@ export class GeminiService implements AIService {
             }
 
             // Convert to Gemini format
-            const history: Content[] = nonSystemMessages.slice(0, -1).map(m => ({
-                role: m.role === 'user' ? 'user' : 'model',
-                parts: this.convertToParts(m.content),
-            }));
+            const rawHistory: Content[] = nonSystemMessages.slice(0, -1).map(m => {
+                const role = m.role as string;
+                const isToolLike = role === 'tool' || role === 'function';
+                return {
+                    role: role === 'user' || isToolLike ? 'user' : 'model',
+                    parts: isToolLike
+                        ? [{ text: `Tool result: ${this.extractText(m.content)}` }]
+                        : this.convertToParts(m.content),
+                };
+            });
+
+            // Gemini requires history to start with role 'user'. Drop leading non-user entries.
+            const firstUserIdx = rawHistory.findIndex(c => c.role === 'user');
+            const history: Content[] = firstUserIdx === -1 ? [] : rawHistory.slice(firstUserIdx);
 
             // Prepare last message with system prompt
             const lastMsg = nonSystemMessages[nonSystemMessages.length - 1];
@@ -92,10 +102,20 @@ export class GeminiService implements AIService {
                 throw new Error('Missing non-system messages');
             }
 
-            const history: Content[] = nonSystemMessages.slice(0, -1).map(m => ({
-                role: m.role === 'user' ? 'user' : 'model',
-                parts: this.convertToParts(m.content),
-            }));
+            const rawHistory: Content[] = nonSystemMessages.slice(0, -1).map(m => {
+                const role = m.role as string;
+                const isToolLike = role === 'tool' || role === 'function';
+                return {
+                    role: role === 'user' || isToolLike ? 'user' : 'model',
+                    parts: isToolLike
+                        ? [{ text: `Tool result: ${this.extractText(m.content)}` }]
+                        : this.convertToParts(m.content),
+                };
+            });
+
+            // Gemini requires history to start with role 'user'. Drop leading non-user entries.
+            const firstUserIdx = rawHistory.findIndex(c => c.role === 'user');
+            const history: Content[] = firstUserIdx === -1 ? [] : rawHistory.slice(firstUserIdx);
 
             const lastMsg = nonSystemMessages[nonSystemMessages.length - 1];
             if (!lastMsg) {
