@@ -78,6 +78,11 @@ interface ProviderKeyConfig {
   instanceId: string;
   apiKey: string;
   priority: number;
+  /**
+   * Provider-specific extra configuration. Currently used to carry the Cloudflare
+   * account ID that is paired with each CLOUDFLARE_KEY_N via CLOUDFLARE_ACCOUNT_ID_N.
+   */
+  accountId?: string;
 }
 
 const collectProviderKeys = (): ProviderKeyConfig[] => {
@@ -130,6 +135,31 @@ const collectProviderKeys = (): ProviderKeyConfig[] => {
     }
   }
 
+  // Cloudflare account-ID pairing.
+  // Each CLOUDFLARE_KEY_N must be paired with CLOUDFLARE_ACCOUNT_ID_N (own account ID).
+  // If only the legacy shared CLOUDFLARE_ACCOUNT_ID is set, use it as a fallback so the
+  // previously-deployed single-account setup keeps working without reconfiguration.
+  // Keys with no resolvable account ID are skipped with a warning.
+  const sharedCloudflareAccountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim() || '';
+
+  for (const [key, config] of [...chosen.entries()]) {
+    if (config.provider !== 'cloudflare') continue;
+
+    const perKeyAccountId = process.env[`CLOUDFLARE_ACCOUNT_ID_${config.instanceId}`]?.trim() || '';
+    const resolvedAccountId = perKeyAccountId || sharedCloudflareAccountId;
+
+    if (!resolvedAccountId) {
+      console.warn(
+        `⚠️  Cloudflare key #${config.instanceId} has no matching ` +
+        `CLOUDFLARE_ACCOUNT_ID_${config.instanceId} (and no shared CLOUDFLARE_ACCOUNT_ID fallback) — skipping.`
+      );
+      chosen.delete(key);
+      continue;
+    }
+
+    config.accountId = resolvedAccountId;
+  }
+
   // Sort by: 1) Provider priority (descending), 2) Instance ID (ascending)
   return [...chosen.values()].sort((a, b) => {
     const priorityA = providerPriorityOrder[a.provider] || 0;
@@ -150,7 +180,13 @@ const createService = (config: ProviderKeyConfig): AIService => {
     case 'cerebras':
       return new CerebrasService(config.apiKey, config.instanceId);
     case 'cloudflare':
-      return new CloudflareService(config.apiKey, config.instanceId);
+      if (!config.accountId) {
+        throw new Error(
+          `Cloudflare key #${config.instanceId} is missing a paired account ID ` +
+          `(CLOUDFLARE_ACCOUNT_ID_${config.instanceId} or shared CLOUDFLARE_ACCOUNT_ID).`
+        );
+      }
+      return new CloudflareService(config.apiKey, config.accountId, config.instanceId);
     default:
       throw new Error(`Unknown provider: ${config.provider}`);
   }
