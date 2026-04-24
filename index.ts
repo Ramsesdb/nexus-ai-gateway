@@ -673,6 +673,13 @@ const server = Bun.serve({
       inFlightRequests++;
       let hasDecrementedInFlight = false; // Prevent double decrement - declared here for catch scope
 
+      const decrementInFlight = () => {
+        if (!hasDecrementedInFlight) {
+          hasDecrementedInFlight = true;
+          inFlightRequests--;
+        }
+      };
+
       try {
         const body = await req.json() as {
           messages?: unknown;
@@ -752,13 +759,6 @@ const server = Bun.serve({
                 : (() => { try { return JSON.stringify(body.tool_choice); } catch { return '<unserializable>'; } })();
           console.warn(`[ProviderErrorBody] ${serviceName} status=${status} body=${errBody}`);
           console.warn(`[IncomingRequest] messages=${msgs} tools_count=${toolsCount} tool_choice=${toolChoice} model=${resolvedModel ?? '(none)'}`);
-        };
-
-        const decrementInFlight = () => {
-          if (!hasDecrementedInFlight) {
-            hasDecrementedInFlight = true;
-            inFlightRequests--;
-          }
         };
 
         const onAbort = () => { aborted = true; };
@@ -1222,6 +1222,8 @@ const server = Bun.serve({
           internalBody,
           { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
         );
+      } finally {
+        decrementInFlight();
       }
     }
 
