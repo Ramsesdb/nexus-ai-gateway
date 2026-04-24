@@ -97,6 +97,13 @@ export interface ResolvedRoute {
    * use the alias instead of forwarding the original string.
    */
   modelAliases: Partial<Record<ProviderType, string>>;
+  /**
+   * When the caller requests a display-name ID like "Groq (Key #2)" (as advertised
+   * by /v1/models), pin the request to that specific tracked service rather than
+   * round-robining across the provider pool. The handler must bypass getNextService
+   * and match on `.service.name`.
+   */
+  pinnedServiceName?: string;
 }
 
 const ALL_PROVIDERS: ProviderType[] = ['groq', 'gemini', 'openrouter', 'cerebras'];
@@ -115,6 +122,23 @@ export function resolveRoute(model?: string): ResolvedRoute {
       ruleLabel: 'no-model (universal)',
       modelAliases: {},
     };
+  }
+
+  // Display-name pin: clients may echo back an ID from /v1/models like "Groq (Key #2)".
+  // Route to that specific tracked service; do NOT forward the display string upstream.
+  const pinMatch = model.trim().match(/^(\w+)\s+\(Key\s+#(\d+)\)$/i);
+  if (pinMatch) {
+    const providerName = pinMatch[1]!.toLowerCase();
+    if (providerName === 'groq' || providerName === 'openrouter' || providerName === 'gemini' || providerName === 'cerebras') {
+      return {
+        providers: new Set([providerName as ProviderType]),
+        isUniversal: false,
+        ruleLabel: `pinned:${model}`,
+        modelAliases: {},
+        pinnedServiceName: model,
+      };
+    }
+    // Unknown provider in the display-name pattern -> fall through to normal rule matching.
   }
 
   const normalized = model.trim().toLowerCase();

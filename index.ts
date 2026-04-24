@@ -154,6 +154,7 @@ const createInitialMetrics = (): ServiceMetrics => ({
   totalRequests: 0,
   successCount: 0,
   failCount: 0,
+  skipCount: 0,
   totalLatencyMs: 0,
 });
 
@@ -392,7 +393,7 @@ const getNextService = (
         // Count as a skip for an otherwise-valid candidate (disabled toggle).
         // Add to excludeIndices so retry loops don't re-count the same skip.
         ts.metrics.totalRequests++;
-        ts.metrics.failCount++;
+        ts.metrics.skipCount++;
         ts.metrics.lastError = `Provider disabled (enabled=false)`;
         ts.metrics.lastErrorTime = Date.now();
         excludeIndices.add(index);
@@ -401,9 +402,11 @@ const getNextService = (
       if (!isServiceAvailable(ts)) {
         // Circuit OPEN / HALF_OPEN-exhausted for a candidate that would have
         // served this request: record the skip so metrics don't freeze.
+        // Do NOT bump failCount or consecutiveFailures — skips should not
+        // feed the circuit breaker, otherwise open circuits never heal.
         // Add to excludeIndices so retry loops don't re-count the same skip.
         ts.metrics.totalRequests++;
-        ts.metrics.failCount++;
+        ts.metrics.skipCount++;
         ts.metrics.lastError = `Circuit breaker state: ${ts.circuitBreaker.state}`;
         ts.metrics.lastErrorTime = Date.now();
         excludeIndices.add(index);
@@ -620,7 +623,9 @@ const server = Bun.serve({
           const total = ts.metrics.totalRequests || 0;
           const success = ts.metrics.successCount || 0;
           const fail = ts.metrics.failCount || 0;
+          const skip = ts.metrics.skipCount || 0;
           const latency = ts.metrics.totalLatencyMs || 0;
+          const rateDenom = success + fail; // Exclude skips from success-rate denominator
           return {
             name: ts.service.name,
             provider: ts.service.provider,
@@ -629,7 +634,8 @@ const server = Bun.serve({
               totalRequests: total,
               successCount: success,
               failCount: fail,
-              successRate: total > 0 ? `${((success / total) * 100).toFixed(1)}%` : 'N/A',
+              skipCount: skip,
+              successRate: rateDenom > 0 ? `${((success / rateDenom) * 100).toFixed(1)}%` : 'N/A',
               avgLatency: total > 0 ? Math.round(latency / total) : 0,
               healthScore: `${(calculateHealthScore(ts) * 100).toFixed(1)}%`,
               consecutiveFailures: ts.circuitBreaker.failures,
@@ -800,12 +806,60 @@ const server = Bun.serve({
           );
         }
 
+        // Resolve a display-name pin ("Groq (Key #2)") to a specific tracked service.
+        // Case-insensitive match on .service.name (since display names are constructed
+        // as `${displayName} (Key #${instanceId})` and callers may echo back variant casing).
+        let pinnedTracked: EnhancedTrackedService | null = null;
+        if (route.pinnedServiceName) {
+          const wanted = route.pinnedServiceName.trim().toLowerCase();
+          pinnedTracked = trackedServices.find(
+            ts => ts.service.name.toLowerCase() === wanted,
+          ) ?? null;
+          if (!pinnedTracked) {
+            inFlightRequests--;
+            hasDecrementedInFlight = true;
+            const unknownBody = JSON.stringify({
+              error: {
+                message: `Unknown model '${body.model}'. No provider instance with that display name is configured.`,
+                type: 'invalid_request_error',
+                param: 'model',
+              },
+            });
+            console.warn('[GatewayReturningError]', 400, unknownBody);
+            return new Response(
+              unknownBody,
+              { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+            );
+          }
+          if (!pinnedTracked.enabled || !isServiceAvailable(pinnedTracked)) {
+            inFlightRequests--;
+            hasDecrementedInFlight = true;
+            const state = pinnedTracked.circuitBreaker.state;
+            const unavailBody = JSON.stringify({
+              error: {
+                message: `pinned model ${pinnedTracked.service.name} unavailable: circuit ${state}`,
+                type: 'service_unavailable',
+                param: 'model',
+              },
+            });
+            console.warn('[GatewayReturningError]', 503, unavailBody);
+            return new Response(
+              unavailBody,
+              { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+            );
+          }
+          // Strip the display-name string so base.ts:69 falls back to the service's default model.
+          chatOptions.model = undefined;
+        }
+
         if (!streamRequested) {
           const triedIndices = new Set<number>();
           let attemptNumber = 0;
 
           while (triedIndices.size < trackedServices.length) {
-            const tracked = getNextService(triedIndices, routingMode, allowedProviders);
+            const tracked = pinnedTracked
+              ? (triedIndices.has(trackedServices.indexOf(pinnedTracked)) ? null : pinnedTracked)
+              : getNextService(triedIndices, routingMode, allowedProviders);
             if (!tracked) {
               if (attemptNumber === 0) {
                 console.warn(`[Router] All candidates circuit-OPEN for rule=${route.ruleLabel}, model=${body.model ?? '(default)'}`);
@@ -937,10 +991,12 @@ const server = Bun.serve({
 
               // Try each service with exponential backoff
               while (triedIndices.size < trackedServices.length && !aborted) {
-                const tracked = getNextService(triedIndices, routingMode, allowedProviders);
+                const tracked = pinnedTracked
+                  ? (triedIndices.has(trackedServices.indexOf(pinnedTracked)) ? null : pinnedTracked)
+                  : getNextService(triedIndices, routingMode, allowedProviders);
                 if (!tracked) {
                   // All circuits might be open - wait and check again
-                  if (attemptNumber > 0) {
+                  if (attemptNumber > 0 && !pinnedTracked) {
                     const backoffDelay = calculateBackoffDelay(attemptNumber);
                     console.log(`[Router] All available circuits tried. Waiting ${backoffDelay}ms before checking again...`);
                     await sleep(backoffDelay);

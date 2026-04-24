@@ -121,6 +121,7 @@ export interface ServiceMetrics {
   totalRequests: number;
   successCount: number;
   failCount: number;
+  skipCount: number;
   totalLatencyMs: number;
   lastError?: string;
   lastErrorTime?: number;
