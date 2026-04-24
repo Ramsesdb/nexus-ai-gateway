@@ -35,9 +35,18 @@ export async function initDatabase(): Promise<void> {
         success INTEGER NOT NULL DEFAULT 1,
         error_message TEXT,
         error_code TEXT,
-        origin_ip TEXT
+        origin_ip TEXT,
+        referer TEXT,
+        user_agent TEXT,
+        request_preview TEXT,
+        response_preview TEXT
       )
     `);
+
+    try { await db.execute(`ALTER TABLE usage_logs ADD COLUMN request_preview TEXT`); } catch { /* column may already exist */ }
+    try { await db.execute(`ALTER TABLE usage_logs ADD COLUMN response_preview TEXT`); } catch { /* column may already exist */ }
+    try { await db.execute(`ALTER TABLE usage_logs ADD COLUMN referer TEXT`); } catch { /* column may already exist */ }
+    try { await db.execute(`ALTER TABLE usage_logs ADD COLUMN user_agent TEXT`); } catch { /* column may already exist */ }
 
     await db.execute(`
       CREATE TABLE IF NOT EXISTS api_keys (
@@ -78,11 +87,15 @@ export function logUsage(params: {
   errorMessage?: string;
   errorCode?: string;
   originIp?: string;
+  referer?: string;
+  userAgent?: string;
+  requestPreview?: string;
+  responsePreview?: string;
 }): void {
   if (!db) return;
   db.execute({
-    sql: `INSERT INTO usage_logs (model, provider, tokens_input, tokens_output, duration_ms, success, error_message, error_code, origin_ip)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    sql: `INSERT INTO usage_logs (model, provider, tokens_input, tokens_output, duration_ms, success, error_message, error_code, origin_ip, referer, user_agent, request_preview, response_preview)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       params.model,
       params.provider,
@@ -93,13 +106,80 @@ export function logUsage(params: {
       params.errorMessage || null,
       params.errorCode || null,
       params.originIp || null,
+      params.referer || null,
+      params.userAgent || null,
+      params.requestPreview || null,
+      params.responsePreview || null,
     ],
   }).catch(err => console.error('[Database] Failed to log usage:', err));
 }
 
-import type { ProviderType } from '../types';
+import type { ProviderType, TrackedService } from '../types';
 
 let modelConfigCache = new Map<string, ProviderType>();
+
+const PROVIDER_MODEL_MAP: Record<ProviderType, { envVar: string; defaultModel: string }> = {
+  groq: { envVar: 'GROQ_MODEL', defaultModel: 'llama-4-scout-17b-16e-instruct' },
+  gemini: { envVar: 'GEMINI_MODEL', defaultModel: 'gemini-2.5-flash' },
+  openrouter: { envVar: 'OPENROUTER_MODEL', defaultModel: 'deepseek/deepseek-r1-0528:free' },
+  cerebras: { envVar: 'CEREBRAS_MODEL', defaultModel: 'zai-glm-4.7' },
+  cloudflare: { envVar: 'CLOUDFLARE_MODEL', defaultModel: '@cf/meta/llama-3.1-8b-instruct' },
+};
+
+export interface SeedKeyConfig {
+  provider: ProviderType;
+  apiKey: string;
+  instanceId: string;
+}
+
+export function seedModels(pool: TrackedService[]): void {
+  if (!db) return;
+  try {
+    const seen = new Set<ProviderType>();
+    for (const tracked of pool) {
+      const provider: ProviderType = tracked.service.provider;
+      if (seen.has(provider)) continue;
+      seen.add(provider);
+      const map = PROVIDER_MODEL_MAP[provider];
+      if (!map) continue;
+      const modelName = process.env[map.envVar]?.trim() || map.defaultModel;
+      db.execute({
+        sql: 'INSERT OR IGNORE INTO model_config (model_name, provider) VALUES (?, ?)',
+        args: [modelName, provider],
+      }).catch(err => console.error(`[Database] seedModels failed for ${provider}:`, err));
+    }
+    db.execute({
+      sql: "INSERT OR IGNORE INTO model_config (model_name, provider) VALUES ('auto', 'auto')",
+      args: [],
+    }).catch(err => console.error('[Database] seedModels failed for auto:', err));
+  } catch (err) {
+    console.error('[Database] seedModels error:', err);
+  }
+}
+
+export function seedApiKeys(keys: SeedKeyConfig[]): void {
+  if (!db) return;
+  try {
+    const displayNames: Record<ProviderType, string> = {
+      groq: 'Groq',
+      gemini: 'Gemini',
+      openrouter: 'OpenRouter',
+      cerebras: 'Cerebras',
+      cloudflare: 'Cloudflare',
+    };
+    for (const key of keys) {
+      const label = `${displayNames[key.provider]} #${key.instanceId}`;
+      db.execute({
+        sql: `INSERT INTO api_keys (provider, key_value, label)
+              SELECT ?, ?, ?
+              WHERE NOT EXISTS (SELECT 1 FROM api_keys WHERE provider = ? AND label = ?)`,
+        args: [key.provider, key.apiKey, label, key.provider, label],
+      }).catch(err => console.error(`[Database] seedApiKeys failed for ${label}:`, err));
+    }
+  } catch (err) {
+    console.error('[Database] seedApiKeys error:', err);
+  }
+}
 
 export async function refreshModelConfigCache(): Promise<void> {
   if (!db) return;

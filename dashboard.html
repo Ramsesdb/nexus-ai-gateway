@@ -813,6 +813,118 @@
         /* ─── CHART CONTAINERS ───────────── */
         .chart-wrap { position: relative; width: 100%; }
         .chart-wrap canvas { width: 100% !important; }
+
+        /* ─── CALL DETAIL EXPAND ────────── */
+        .call-detail-row {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.35s ease, opacity 0.3s ease;
+            opacity: 0;
+        }
+        .call-detail-row.open {
+            max-height: 900px;
+            opacity: 1;
+        }
+        .call-detail-row td {
+            padding: 0 20px;
+            border-top: 1px solid rgba(255,255,255,0.04);
+        }
+        .call-detail-inner {
+            padding: 18px 0;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        .call-preview-box {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+        }
+        .call-preview-label {
+            padding: 8px 14px;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-dim);
+            background: rgba(255,255,255,0.03);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .call-preview-content {
+            padding: 12px 14px;
+            font-size: 0.82rem;
+            color: var(--text-secondary);
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+        }
+        .error-display {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding: 14px;
+            background: rgba(255,71,87,0.08);
+            border-left: 3px solid var(--accent-red);
+            border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+        }
+        .error-code-display {
+            font-size: 0.7rem;
+            font-weight: 700;
+            color: var(--accent-red);
+            letter-spacing: 0.5px;
+        }
+        .error-msg-display {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            font-family: 'Cascadia Code', Consolas, monospace;
+        }
+        .status-dot-inline {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            margin-right: 5px;
+            vertical-align: middle;
+        }
+        .status-dot-inline.ok { background: var(--accent-primary); box-shadow: 0 0 6px var(--accent-primary); }
+        .status-dot-inline.err { background: var(--accent-red); box-shadow: 0 0 6px var(--accent-red); }
+        .summary-cell {
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            display: inline-block;
+            color: var(--text-dim);
+            font-size: 0.8rem;
+            vertical-align: middle;
+        }
+        .model-cell {
+            max-width: 140px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            display: inline-block;
+        }
+        /* ─── MOBILE CALL LOG ───────────── */
+        @media (max-width: 768px) {
+            #panel-calls table th:nth-child(4),
+            #panel-calls table td:nth-child(4),
+            #panel-calls table th:nth-child(5),
+            #panel-calls table td:nth-child(5),
+            #panel-calls table th:nth-child(9),
+            #panel-calls table td:nth-child(9) {
+                display: none;
+            }
+            .summary-cell { max-width: 100px; }
+            .model-cell { max-width: 100px; }
+        }
     </style>
 </head>
 <body>
@@ -1001,7 +1113,7 @@
                 </div>
                 <div class="table-wrap">
                     <table>
-                        <thead><tr><th>Time</th><th>Model</th><th>Provider</th><th>Tokens In</th><th>Tokens Out</th><th>Duration</th><th>Status</th><th>Origin</th><th>Error</th></tr></thead>
+                        <thead><tr><th>Time</th><th>Model</th><th>Provider</th><th>Tokens In</th><th>Tokens Out</th><th>Duration</th><th>Status</th><th>Origin</th><th>Summary</th></tr></thead>
                         <tbody id="table-calls"><tr><td colspan="9" class="empty-state"><div class="loading-shimmer" style="width:80%;margin:0 auto"></div></td></tr></tbody>
                     </table>
                 </div>
@@ -1033,6 +1145,7 @@
     let summaryTimer = null;
     let lastSummaryData = null;
     let callTotal = 0;
+    let isInitialLoad = true;
 
     /* ── HELPERS ───────────────────────── */
     const fmt = (n) => n != null ? n.toLocaleString() : '--';
@@ -1140,6 +1253,7 @@
         try {
             const data = await api('/dashboard/summary');
             lastSummaryData = data;
+            isInitialLoad = false;
             const total = (data.tokens_input_today || 0) + (data.tokens_output_today || 0);
             $('kpi-tokens').textContent = fmt(total);
             $('kpi-tokens-in').textContent = fmt(data.tokens_input_today);
@@ -1161,6 +1275,7 @@
     async function loadUsageData() {
         try {
             const data = await api('/dashboard/usage?period=daily&days=30');
+            isInitialLoad = false;
             destroyChart('tokensDaily');
             const ctx = $('chart-tokens-daily').getContext('2d');
             const labels = data.map(d => d.date.slice(5));
@@ -1186,6 +1301,7 @@
             if (dLabel) dLabel.textContent = periodLabel;
 
             const data = await api('/dashboard/usage-by-model?days=' + days);
+            isInitialLoad = false;
             const top5 = data.slice(0, 5);
 
             destroyChart('tokensModel');
@@ -1228,7 +1344,7 @@
                     </tr>`;
                 }).join('');
             }
-        } catch (e) { console.error('loadModelsUsage:', e); }
+        } catch (e) { console.error('loadModelsUsage:', e); if (isInitialLoad) { $('table-top-models').innerHTML = '<tr><td colspan="6" class="empty-state">Failed to load</td></tr>'; } }
     }
 
     /* ══════════════════════════════════════
@@ -1622,23 +1738,59 @@
                 tbody.innerHTML += filtered.map(c => {
                     const time = new Date(c.timestamp);
                     const isErr = !c.success;
-                    return `
-                        <tr class="clickable-row ${isErr ? 'expanded-parent' : ''}" data-call-id="${c.id}" onclick="toggleCallDetail(this, ${c.id})">
+                    const modelName = escHtml(c.model || '—');
+                    const modelDisplay = modelName.length > 20 ? modelName.slice(0, 18) + '…' : modelName;
+                    const summary = escHtml(c.request_preview || (isErr ? c.error_message || 'Error' : '—'));
+                    const summaryDisplay = summary.length > 50 ? summary.slice(0, 47) + '…' : summary;
+
+                    const detailHtml = [
+                        `<div class="call-preview-box">
+                            <div class="call-preview-label">🌐 Origin</div>
+                            <div class="call-preview-content"><strong>IP:</strong> ${escHtml(c.origin_ip || 'Unknown')}</div>
+                        </div>`,
+                        c.referer ? `<div class="call-preview-box">
+                            <div class="call-preview-label">🔗 Referer</div>
+                            <div class="call-preview-content">${escHtml(c.referer)}</div>
+                        </div>` : `<div class="call-preview-box">
+                            <div class="call-preview-label">🔗 Referer</div>
+                            <div class="call-preview-content" style="color:var(--text-dim)">Direct / Unknown</div>
+                        </div>`,
+                        c.user_agent ? (() => {
+                            const ua = c.user_agent;
+                            const label = parseUserAgent(ua);
+                            return `<div class="call-preview-box">
+                                <div class="call-preview-label">🖥️ User Agent</div>
+                                <div class="call-preview-content"><strong>${label}</strong><br><span style="font-size:0.72rem;color:var(--text-dim);word-break:break-all">${escHtml(ua)}</span></div>
+                            </div>`;
+                        })() : '',
+                        c.request_preview ? `<div class="call-preview-box">
+                            <div class="call-preview-label">📥 Request</div>
+                            <div class="call-preview-content">${escHtml(c.request_preview)}</div>
+                        </div>` : '',
+                        c.response_preview ? `<div class="call-preview-box">
+                            <div class="call-preview-label">📤 Response</div>
+                            <div class="call-preview-content">${escHtml(c.response_preview)}</div>
+                        </div>` : '',
+                        isErr ? `<div class="error-display">
+                            <div class="error-code-display">${escHtml(c.error_code || 'ERROR')}</div>
+                            <div class="error-msg-display">${escHtml(c.error_message || 'No error message')}</div>
+                        </div>` : '',
+                        !c.request_preview && !c.response_preview && !isErr ? '<div style="padding:8px 0;color:var(--text-dim);font-size:0.82rem">No request/response data available</div>' : ''
+                    ].filter(Boolean).join('\n');
+
+                    return `<tr class="clickable-row" data-call-id="${c.id}" onclick="toggleCallDetail(this, ${c.id})">
                             <td style="color:var(--text-dim);font-size:0.78rem">${time.toLocaleString('en-US', { hour12: false })}</td>
-                            <td style="color:var(--text-primary)">${escHtml(c.model)}</td>
-                            <td>${escHtml(c.provider)}</td>
+                            <td style="color:var(--text-primary)"><span class="model-cell" title="${escAttr(c.model || '')}">${modelDisplay}</span></td>
+                            <td>${escHtml(c.provider || '—')}</td>
                             <td>${fmt(c.tokens_input)}</td>
                             <td>${fmt(c.tokens_output)}</td>
                             <td>${fmtMs(c.duration_ms)}</td>
-                            <td><span class="badge ${isErr ? 'error' : 'success'}"><span class="badge-dot"></span>${isErr ? 'Error' : 'OK'}</span></td>
+                            <td><span class="status-dot-inline ${isErr ? 'err' : 'ok'}"></span>${isErr ? 'Error' : 'OK'}</td>
                             <td style="font-family:monospace;font-size:0.75rem">${escHtml(c.origin_ip || '—')}</td>
-                            <td style="color:${isErr ? 'var(--accent-red)' : 'var(--text-dim)'}">${isErr ? '⚠' : '—'}</td>
+                            <td><span class="summary-cell" title="${escAttr(summary)}">${summaryDisplay}</span></td>
                         </tr>
-                        <tr class="call-detail" id="call-detail-${c.id}" style="display:none">
-                            ${isErr ? `<td colspan="9" class="expanded-row">
-                                <div class="error-detail">${escHtml(c.error_message || 'No error message')}</div>
-                                ${c.error_code ? `<div style="color:var(--text-dim);margin-top:4px;font-size:0.7rem">Code: ${escHtml(c.error_code)}</div>` : ''}
-                            </td>` : '<td colspan="9" style="color:var(--text-dim);padding:10px 20px">Request completed successfully</td>'}
+                        <tr class="call-detail-row" id="call-detail-${c.id}">
+                            <td colspan="9"><div class="call-detail-inner">${detailHtml}</div></td>
                         </tr>`;
                 }).join('');
 
@@ -1651,7 +1803,6 @@
                 }
             }
 
-            // Compute average latency
             if (!append && data.length > 0) {
                 const latencies = data.filter(c => c.duration_ms != null).map(c => c.duration_ms);
                 if (latencies.length > 0) {
@@ -1666,9 +1817,16 @@
     }
 
     window.toggleCallDetail = function(row, id) {
-        const detail = document.getElementById('call-detail-' + id);
-        if (detail) {
-            detail.style.display = detail.style.display === 'none' ? '' : 'none';
+        const detailRow = document.getElementById('call-detail-' + id);
+        if (!detailRow) return;
+        const isOpen = detailRow.classList.contains('open');
+        document.querySelectorAll('.call-detail-row.open').forEach(r => {
+            if (r !== detailRow) r.classList.remove('open');
+        });
+        if (isOpen) {
+            detailRow.classList.remove('open');
+        } else {
+            detailRow.classList.add('open');
         }
     };
 
@@ -1717,6 +1875,17 @@
     function escHtml(s) {
         if (s == null) return '';
         return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function parseUserAgent(ua) {
+        const s = String(ua || '');
+        if (/Chrome/i.test(s)) return '🌐 Chrome';
+        if (/Firefox/i.test(s)) return '🦊 Firefox';
+        if (/curl/i.test(s)) return '📟 curl';
+        if (/Python/i.test(s)) return '🐍 Python';
+        if (/Postman/i.test(s)) return '📮 Postman';
+        if (/Mobile|Android|iPhone/i.test(s)) return '📱 Mobile';
+        return s;
     }
 
     function escAttr(s) {

@@ -9,7 +9,7 @@ import { OpenRouterService } from './services/openrouter';
 import { CerebrasService } from './services/cerebras';
 import { CloudflareService } from './services/cloudflare';
 import { resolveRoute, type ResolvedRoute } from './services/router';
-import { initDatabase, getDb, logUsage, refreshModelConfigCache, getCachedModelProvider, maskKey } from './services/database';
+import { initDatabase, getDb, logUsage, refreshModelConfigCache, getCachedModelProvider, maskKey, seedModels, seedApiKeys, type SeedKeyConfig } from './services/database';
 import type {
   AIService,
   ChatMessage,
@@ -207,8 +207,10 @@ const createInitialCircuitBreaker = (): CircuitBreakerState => ({
   halfOpenAttempts: 0,
 });
 
+const providerKeyConfigs = collectProviderKeys();
+
 // Initialize services
-for (const config of collectProviderKeys()) {
+for (const config of providerKeyConfigs) {
   try {
     const service = createService(config);
     trackedServices.push({
@@ -373,6 +375,24 @@ const extractRetryAfter = (err: unknown): number | undefined => {
   if (!raw) return undefined;
   const n = Number(raw);
   return Number.isFinite(n) ? n : undefined;
+};
+
+const extractRequestPreview = (messages: unknown): string => {
+  try {
+    const arr = messages as any[];
+    if (!Array.isArray(arr)) return '';
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const m = arr[i];
+      if (m?.role !== 'user') continue;
+      if (typeof m.content === 'string') return m.content.slice(0, 200);
+      if (Array.isArray(m.content)) {
+        const textPart = m.content.find((p: any) => p?.type === 'text');
+        if (textPart && typeof textPart.text === 'string') return textPart.text.slice(0, 200);
+      }
+      return '';
+    }
+  } catch { /* ignore */ }
+  return '';
 };
 
 // --- 7. HEALTH-AWARE LOAD BALANCER ---
@@ -573,6 +593,8 @@ let dashboardHtml = '';
   }
   await initDatabase();
   await refreshModelConfigCache();
+  seedModels(trackedServices);
+  seedApiKeys(providerKeyConfigs);
 })();
 
 const server = Bun.serve({
@@ -720,7 +742,7 @@ const server = Bun.serve({
           args.push(parseInt(success));
         }
         const result = await dbClient.execute({
-          sql: `SELECT id, timestamp, model, provider, tokens_input, tokens_output, duration_ms, success, error_message, error_code, origin_ip FROM usage_logs ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+          sql: `SELECT id, timestamp, model, provider, tokens_input, tokens_output, duration_ms, success, error_message, error_code, origin_ip, referer, user_agent, request_preview, response_preview FROM usage_logs ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
           args: [...args, limit, offset],
         });
         return new Response(JSON.stringify(result.rows), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
@@ -978,7 +1000,10 @@ const server = Bun.serve({
     // Chat Completions
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
       inFlightRequests++;
-      let hasDecrementedInFlight = false; // Prevent double decrement - declared here for catch scope
+      let hasDecrementedInFlight = false;
+
+      const referer = req.headers.get('referer') || '';
+      const userAgent = req.headers.get('user-agent') || '';
 
       const decrementInFlight = () => {
         if (!hasDecrementedInFlight) {
@@ -1037,6 +1062,7 @@ const server = Bun.serve({
         }
 
         const typedMessages = messages as ChatMessage[];
+        const requestPreview = extractRequestPreview(messages);
         const requestId = `chatcmpl-${crypto.randomUUID()}`;
         const created = Math.floor(Date.now() / 1000);
         const encoder = new TextEncoder();
@@ -1229,6 +1255,9 @@ const server = Bun.serve({
 
               const usage = (completion as any)?.usage;
               const originIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+              const responsePreview = typeof (completion as any)?.choices?.[0]?.message?.content === 'string'
+                ? (completion as any).choices[0].message.content.slice(0, 300)
+                : undefined;
               logUsage({
                 model: serviceOptions.model || service.name,
                 provider: service.provider,
@@ -1237,6 +1266,10 @@ const server = Bun.serve({
                 durationMs: Date.now() - startTime,
                 success: 1,
                 originIp,
+                referer,
+                userAgent,
+                requestPreview,
+                responsePreview,
               });
 
               return new Response(JSON.stringify(completion), {
@@ -1274,6 +1307,9 @@ const server = Bun.serve({
                 errorMessage: errorMsg,
                 errorCode: status ? String(status) : undefined,
                 originIp: failOriginIp,
+                referer,
+                userAgent,
+                requestPreview,
               });
             }
           }
@@ -1296,6 +1332,7 @@ const server = Bun.serve({
         const stream = new ReadableStream({
           async start(controller) {
             let controllerClosed = false;
+            let responseContent = '';
             const safeEnqueue = (chunk: Uint8Array) => {
               if (controllerClosed) return;
               try {
@@ -1320,6 +1357,7 @@ const server = Bun.serve({
               let attemptNumber = 0;
 
               const emitChunk = (service: AIService, content: string) => {
+                responseContent += content;
                 const data = {
                   id: requestId,
                   object: 'chat.completion.chunk',
@@ -1479,6 +1517,10 @@ const server = Bun.serve({
                       durationMs: Date.now() - startTime,
                       success: 1,
                       originIp: streamOriginIp1,
+                      referer,
+                      userAgent,
+                      requestPreview,
+                      responsePreview: responseContent.slice(0, 300) || undefined,
                     });
                     // Emit metadata for non-streaming response too
                     emitMetadata(
@@ -1521,6 +1563,10 @@ const server = Bun.serve({
                       durationMs: Date.now() - startTime,
                       success: 1,
                       originIp: streamOriginIp2,
+                      referer,
+                      userAgent,
+                      requestPreview,
+                      responsePreview: responseContent.slice(0, 300) || undefined,
                     });
                     break;
                   }
@@ -1558,6 +1604,10 @@ const server = Bun.serve({
                     errorMessage: errorMsg,
                     errorCode: status ? String(status) : undefined,
                     originIp: streamFailOriginIp,
+                    referer,
+                    userAgent,
+                    requestPreview,
+                    responsePreview: responseContent.slice(0, 300) || undefined,
                   });
 
                   if (started) break;
