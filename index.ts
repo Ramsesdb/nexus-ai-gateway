@@ -386,9 +386,29 @@ const getNextService = (
     .map((ts, index) => ({ ts, index }))
     .filter(({ ts, index }) => {
       if (excludeIndices.has(index)) return false;
-      if (!ts.enabled) return false;
-      if (!isServiceAvailable(ts)) return false;
+      // Provider is not a candidate for this request — do NOT count as a skip.
       if (allowedProviders && !allowedProviders.has(ts.service.provider)) return false;
+      if (!ts.enabled) {
+        // Count as a skip for an otherwise-valid candidate (disabled toggle).
+        // Add to excludeIndices so retry loops don't re-count the same skip.
+        ts.metrics.totalRequests++;
+        ts.metrics.failCount++;
+        ts.metrics.lastError = `Provider disabled (enabled=false)`;
+        ts.metrics.lastErrorTime = Date.now();
+        excludeIndices.add(index);
+        return false;
+      }
+      if (!isServiceAvailable(ts)) {
+        // Circuit OPEN / HALF_OPEN-exhausted for a candidate that would have
+        // served this request: record the skip so metrics don't freeze.
+        // Add to excludeIndices so retry loops don't re-count the same skip.
+        ts.metrics.totalRequests++;
+        ts.metrics.failCount++;
+        ts.metrics.lastError = `Circuit breaker state: ${ts.circuitBreaker.state}`;
+        ts.metrics.lastErrorTime = Date.now();
+        excludeIndices.add(index);
+        return false;
+      }
       return true;
     });
 
@@ -968,23 +988,40 @@ const server = Bun.serve({
                 try {
                   const gen = service.chat(typedMessages, streamOptions);
 
-                  // First-token timeout
+                  // First-token timeout.
+                  // On timeout rejection: the outer `catch (err)` below records
+                  // the provider failure (failCount++, recordFailure) and the
+                  // `finally` at the end of start() calls decrementInFlight().
+                  // The idempotency flag on decrementInFlight() guarantees no
+                  // double-decrement even if `cancel()` fires later because the
+                  // Response has already been returned to the client.
+                  // We additionally close the pending generator so the upstream
+                  // fetch doesn't keep running in the background after timeout.
                   const firstResult = await (async () => {
                     if (started || CONFIG.firstTokenTimeoutMs <= 0) {
                       return gen.next();
                     }
 
                     let timeoutId: ReturnType<typeof setTimeout> | undefined;
+                    let timedOut = false;
                     try {
                       const timeoutPromise = new Promise<never>((_, reject) => {
                         timeoutId = setTimeout(
-                          () => reject(new Error(`First token timeout after ${CONFIG.firstTokenTimeoutMs}ms`)),
+                          () => {
+                            timedOut = true;
+                            reject(new Error(`First token timeout after ${CONFIG.firstTokenTimeoutMs}ms`));
+                          },
                           CONFIG.firstTokenTimeoutMs
                         );
                       });
-                      return Promise.race([gen.next(), timeoutPromise]);
+                      return await Promise.race([gen.next(), timeoutPromise]);
                     } finally {
                       if (timeoutId) clearTimeout(timeoutId);
+                      if (timedOut) {
+                        // Best-effort: release the abandoned generator so the
+                        // upstream HTTP request is cancelled.
+                        try { void gen.return?.(undefined); } catch { /* ignore */ }
+                      }
                     }
                   })();
 
