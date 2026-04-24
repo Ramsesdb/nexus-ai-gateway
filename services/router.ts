@@ -104,6 +104,13 @@ export interface ResolvedRoute {
    * and match on `.service.name`.
    */
   pinnedServiceName?: string;
+  /**
+   * When true, the handler must strip `chatOptions.model` before dispatching to the
+   * upstream provider so each picked service falls back to its configured default
+   * (see `base.ts:69`). Set by the `auto` pseudo-model branch; pinned routes strip
+   * via `pinnedServiceName` logic already.
+   */
+  stripModel?: boolean;
 }
 
 const ALL_PROVIDERS: ProviderType[] = ['groq', 'gemini', 'openrouter', 'cerebras'];
@@ -121,6 +128,19 @@ export function resolveRoute(model?: string): ResolvedRoute {
       isUniversal: true,
       ruleLabel: 'no-model (universal)',
       modelAliases: {},
+    };
+  }
+
+  // "auto" pseudo-model: full universal routing across every configured provider,
+  // with the model string stripped so each picked service uses its own default.
+  // Lets clients say "let the gateway pick" without knowing which keys are healthy.
+  if (model.trim().toLowerCase() === 'auto') {
+    return {
+      providers: new Set(ALL_PROVIDERS),
+      isUniversal: true,
+      ruleLabel: 'auto',
+      modelAliases: {},
+      stripModel: true,
     };
   }
 

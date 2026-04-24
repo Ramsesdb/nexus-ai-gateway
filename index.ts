@@ -655,12 +655,20 @@ const server = Bun.serve({
     if (req.method === 'GET' && url.pathname === '/v1/models') {
       const models = {
         object: 'list',
-        data: trackedServices.map(ts => ({
-          id: ts.service.name,
-          object: 'model',
-          owned_by: ts.service.provider,
-          available: ts.enabled && isServiceAvailable(ts),
-        })),
+        data: [
+          {
+            id: 'auto',
+            object: 'model',
+            owned_by: 'nexus',
+            available: true,
+          },
+          ...trackedServices.map(ts => ({
+            id: ts.service.name,
+            object: 'model',
+            owned_by: ts.service.provider,
+            available: ts.enabled && isServiceAvailable(ts),
+          })),
+        ],
       };
 
       return new Response(JSON.stringify(models), {
@@ -882,8 +890,15 @@ const server = Bun.serve({
 
             // Apply per-provider model alias when the original model string is
             // incompatible with this provider (e.g. "openai/gpt-4.1-mini" -> Groq).
+            // Strip the outgoing model for "auto" routes and display-name pins so
+            // the upstream service falls back to its own default model.
+            const shouldStripModel = route.stripModel || !!route.pinnedServiceName;
             const alias = modelAliases[service.provider];
-            const serviceOptions = alias ? { ...chatOptions, model: alias } : chatOptions;
+            const serviceOptions = shouldStripModel
+              ? { ...chatOptions, model: undefined }
+              : alias
+                ? { ...chatOptions, model: alias }
+                : chatOptions;
 
             try {
               const completion = service.createChatCompletion
@@ -1030,8 +1045,15 @@ const server = Bun.serve({
 
                 // Apply per-provider model alias when the original model string is
                 // incompatible with this provider (e.g. "openai/gpt-4.1-mini" -> Groq).
+                // Strip the outgoing model for "auto" routes and display-name pins so
+                // the upstream service falls back to its own default model.
+                const shouldStripModel = route.stripModel || !!route.pinnedServiceName;
                 const streamAlias = modelAliases[service.provider];
-                const streamOptions = streamAlias ? { ...chatOptions, model: streamAlias } : chatOptions;
+                const streamOptions = shouldStripModel
+                  ? { ...chatOptions, model: undefined }
+                  : streamAlias
+                    ? { ...chatOptions, model: streamAlias }
+                    : chatOptions;
 
                 // Track half-open attempts
                 if (tracked.circuitBreaker.state === 'HALF_OPEN') {
