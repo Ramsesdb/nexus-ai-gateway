@@ -1103,7 +1103,11 @@ const server = Bun.serve({
                     }
                   })();
 
+                  const includeMetadataQuery = url.searchParams.get('include_metadata') === 'true';
+                  const includeMetadataHeader = (req.headers.get('x-nexus-include-metadata') || '').toLowerCase() === 'true';
+                  const includeMetadata = includeMetadataQuery || includeMetadataHeader;
                   const emitMetadata = (service: AIService, latency: number, circuitState: string, health: number) => {
+                    if (!includeMetadata) return;
                     const metadata = {
                       type: 'nexus-metadata',
                       metadata: {
