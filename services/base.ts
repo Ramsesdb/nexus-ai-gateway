@@ -36,6 +36,7 @@ export abstract class BaseOpenAIService implements AIService {
     public readonly provider: ProviderType;
     protected readonly model: string;
     protected readonly extraParams: Record<string, unknown>;
+    public lastStreamUsage: { prompt_tokens: number; completion_tokens: number } | null = null;
 
     constructor(options: OpenAIServiceOptions) {
         this.provider = options.provider;
@@ -73,7 +74,14 @@ export abstract class BaseOpenAIService implements AIService {
             });
 
             for await (const chunk of completion) {
-                const content = (chunk as any).choices[0]?.delta?.content;
+                const ch = chunk as any;
+                if (ch.usage) {
+                    this.lastStreamUsage = {
+                        prompt_tokens: ch.usage.prompt_tokens || 0,
+                        completion_tokens: ch.usage.completion_tokens || 0,
+                    };
+                }
+                const content = ch.choices[0]?.delta?.content;
                 if (content) {
                     yield content;
                 }

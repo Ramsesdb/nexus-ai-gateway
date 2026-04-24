@@ -9,6 +9,7 @@ import { OpenRouterService } from './services/openrouter';
 import { CerebrasService } from './services/cerebras';
 import { CloudflareService } from './services/cloudflare';
 import { resolveRoute, type ResolvedRoute } from './services/router';
+import { initDatabase, getDb, logUsage, refreshModelConfigCache, getCachedModelProvider, maskKey } from './services/database';
 import type {
   AIService,
   ChatMessage,
@@ -562,6 +563,18 @@ console.log(`📊 Load Balancing: Health-Aware + Circuit Breaker`);
 console.log(`🌐 CORS Origins: ${CONFIG.corsAllowedOrigins.join(', ')}`);
 console.log(`⚡ Circuit Breaker: ${CONFIG.circuitBreaker.failureThreshold} failures -> OPEN for ${CONFIG.circuitBreaker.resetTimeoutMs / 1000}s`);
 
+let dashboardHtml = '';
+
+(async () => {
+  try {
+    dashboardHtml = await Bun.file('./dashboard.html').text();
+  } catch {
+    console.warn('[Dashboard] dashboard.html not found. GET /dashboard will return 404.');
+  }
+  await initDatabase();
+  await refreshModelConfigCache();
+})();
+
 const server = Bun.serve({
   port: CONFIG.port,
   // Increase idle timeout to allow long streaming responses
@@ -595,9 +608,251 @@ const server = Bun.serve({
       return new Response(null, { headers: corsHeaders });
     }
 
+    // --- DASHBOARD ROUTES (no auth required) ---
+
+    // Serve dashboard HTML page
+    if (req.method === 'GET' && url.pathname === '/dashboard') {
+      if (!dashboardHtml) {
+        return new Response('Dashboard not available', { status: 404, headers: { 'Content-Type': 'text/plain', ...corsHeaders } });
+      }
+      return new Response(dashboardHtml, { headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders } });
+    }
+
+    // Dashboard summary
+    if (req.method === 'GET' && url.pathname === '/dashboard/summary') {
+      const dbClient = getDb();
+      if (!dbClient) {
+        return new Response(JSON.stringify({
+          tokens_input_today: 0, tokens_output_today: 0, requests_today: 0, errors_today: 0,
+          tokens_input_week: 0, tokens_output_week: 0, requests_week: 0,
+          tokens_input_month: 0, tokens_output_month: 0, requests_month: 0,
+        }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+      try {
+        const today = await dbClient.execute(`SELECT COALESCE(SUM(tokens_input),0) AS ti, COALESCE(SUM(tokens_output),0) AS to_, COUNT(*) AS req, COALESCE(SUM(CASE WHEN success=0 THEN 1 ELSE 0 END),0) AS err FROM usage_logs WHERE date(timestamp)=date('now')`);
+        const week = await dbClient.execute(`SELECT COALESCE(SUM(tokens_input),0) AS ti, COALESCE(SUM(tokens_output),0) AS to_, COUNT(*) AS req FROM usage_logs WHERE date(timestamp)>=date('now','-7 days')`);
+        const month = await dbClient.execute(`SELECT COALESCE(SUM(tokens_input),0) AS ti, COALESCE(SUM(tokens_output),0) AS to_, COUNT(*) AS req FROM usage_logs WHERE date(timestamp)>=date('now','-30 days')`);
+        const t = today.rows[0] as any; const w = week.rows[0] as any; const mo = month.rows[0] as any;
+        return new Response(JSON.stringify({
+          tokens_input_today: Number(t?.ti ?? 0), tokens_output_today: Number(t?.to_ ?? 0), requests_today: Number(t?.req ?? 0), errors_today: Number(t?.err ?? 0),
+          tokens_input_week: Number(w?.ti ?? 0), tokens_output_week: Number(w?.to_ ?? 0), requests_week: Number(w?.req ?? 0),
+          tokens_input_month: Number(mo?.ti ?? 0), tokens_output_month: Number(mo?.to_ ?? 0), requests_month: Number(mo?.req ?? 0),
+        }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (err) {
+        console.error('[Dashboard/summary]', err);
+        return new Response(JSON.stringify({ error: 'Query failed' }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    // Dashboard usage time-series
+    if (req.method === 'GET' && url.pathname === '/dashboard/usage') {
+      const dbClient = getDb();
+      if (!dbClient) {
+        return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+      try {
+        const period = url.searchParams.get('period') || 'daily';
+        const days = Math.min(parseInt(url.searchParams.get('days') || '30') || 30, 365);
+        const groupBy = period === 'weekly' ? `strftime('%Y-W%W', timestamp)` : `date(timestamp)`;
+        const result = await dbClient.execute({
+          sql: `SELECT ${groupBy} AS date, COALESCE(SUM(tokens_input),0) AS tokens_input, COALESCE(SUM(tokens_output),0) AS tokens_output, COUNT(*) AS requests, COALESCE(SUM(CASE WHEN success=0 THEN 1 ELSE 0 END),0) AS errors FROM usage_logs WHERE date(timestamp)>=date('now',?) GROUP BY date ORDER BY date ASC`,
+          args: [`-${days} days`],
+        });
+        return new Response(JSON.stringify(result.rows), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (err) {
+        console.error('[Dashboard/usage]', err);
+        return new Response(JSON.stringify([]), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    // Dashboard usage by model
+    if (req.method === 'GET' && url.pathname === '/dashboard/usage-by-model') {
+      const dbClient = getDb();
+      if (!dbClient) {
+        return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+      try {
+        const days = Math.min(parseInt(url.searchParams.get('days') || '30') || 30, 365);
+        const result = await dbClient.execute({
+          sql: `SELECT model, COALESCE(SUM(tokens_input),0) AS tokens_input, COALESCE(SUM(tokens_output),0) AS tokens_output, COUNT(*) AS requests, COALESCE(SUM(CASE WHEN success=0 THEN 1 ELSE 0 END),0) AS errors FROM usage_logs WHERE date(timestamp)>=date('now',?) GROUP BY model ORDER BY requests DESC`,
+          args: [`-${days} days`],
+        });
+        return new Response(JSON.stringify(result.rows), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (err) {
+        console.error('[Dashboard/usage-by-model]', err);
+        return new Response(JSON.stringify([]), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    // Dashboard usage by key
+    if (req.method === 'GET' && url.pathname === '/dashboard/usage-by-key') {
+      const dbClient = getDb();
+      if (!dbClient) {
+        return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+      try {
+        const days = Math.min(parseInt(url.searchParams.get('days') || '30') || 30, 365);
+        const result = await dbClient.execute({
+          sql: `SELECT k.id, k.label, COALESCE(SUM(u.tokens_input),0) AS tokens_input, COALESCE(SUM(u.tokens_output),0) AS tokens_output, COUNT(u.id) AS requests FROM usage_logs u LEFT JOIN api_keys k ON k.provider=u.provider AND k.active=1 WHERE date(u.timestamp)>=date('now',?) GROUP BY k.id ORDER BY requests DESC`,
+          args: [`-${days} days`],
+        });
+        return new Response(JSON.stringify(result.rows), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (err) {
+        console.error('[Dashboard/usage-by-key]', err);
+        return new Response(JSON.stringify([]), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    // Dashboard calls
+    if (req.method === 'GET' && url.pathname === '/dashboard/calls') {
+      const dbClient = getDb();
+      if (!dbClient) {
+        return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+      try {
+        const limit = Math.min(parseInt(url.searchParams.get('limit') || '50') || 50, 500);
+        const offset = parseInt(url.searchParams.get('offset') || '0') || 0;
+        const success = url.searchParams.get('success');
+        let where = '';
+        const args: any[] = [];
+        if (success !== null && success !== '') {
+          where = 'WHERE success=?';
+          args.push(parseInt(success));
+        }
+        const result = await dbClient.execute({
+          sql: `SELECT id, timestamp, model, provider, tokens_input, tokens_output, duration_ms, success, error_message, error_code, origin_ip FROM usage_logs ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+          args: [...args, limit, offset],
+        });
+        return new Response(JSON.stringify(result.rows), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (err) {
+        console.error('[Dashboard/calls]', err);
+        return new Response(JSON.stringify([]), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    // Dashboard models CRUD
+    if (req.method === 'GET' && url.pathname === '/dashboard/models') {
+      const dbClient = getDb();
+      if (!dbClient) return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      try {
+        const result = await dbClient.execute('SELECT id, model_name, provider, active, created_at FROM model_config ORDER BY id');
+        return new Response(JSON.stringify(result.rows), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (err) {
+        return new Response(JSON.stringify([]), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/dashboard/models') {
+      const dbClient = getDb();
+      if (!dbClient) return new Response(JSON.stringify({ error: 'Database unavailable' }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      try {
+        const body = await req.json() as { model_name?: string; provider?: string; active?: number };
+        if (!body.model_name || !body.provider) {
+          return new Response(JSON.stringify({ error: { message: 'model_name and provider are required' } }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+        await dbClient.execute({
+          sql: `INSERT INTO model_config (model_name, provider, active) VALUES (?, ?, ?) ON CONFLICT(model_name) DO UPDATE SET provider=excluded.provider, active=excluded.active`,
+          args: [body.model_name, body.provider, body.active ?? 1],
+        });
+        await refreshModelConfigCache();
+        return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (err) {
+        console.error('[Dashboard/models POST]', err);
+        return new Response(JSON.stringify({ error: { message: 'Failed to save model config' } }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    const modelsByIdMatch = url.pathname.match(/^\/dashboard\/models\/(\d+)$/);
+    if (modelsByIdMatch) {
+      const id = parseInt(modelsByIdMatch[1]!);
+      const dbClient = getDb();
+      if (!dbClient) return new Response(JSON.stringify({ error: 'Database unavailable' }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      try {
+        if (req.method === 'PUT') {
+          const body = await req.json() as { model_name?: string; provider?: string; active?: number };
+          if (!body.model_name || !body.provider || body.active === undefined) {
+            return new Response(JSON.stringify({ error: { message: 'model_name, provider, and active are required' } }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+          }
+          await dbClient.execute({
+            sql: 'UPDATE model_config SET model_name=?, provider=?, active=? WHERE id=?',
+            args: [body.model_name, body.provider, body.active, id],
+          });
+          await refreshModelConfigCache();
+          return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+        if (req.method === 'DELETE') {
+          await dbClient.execute({ sql: 'DELETE FROM model_config WHERE id=?', args: [id] });
+          await refreshModelConfigCache();
+          return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+      } catch (err) {
+        console.error('[Dashboard/models/:id]', err);
+        return new Response(JSON.stringify({ error: { message: 'Failed' } }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    // Dashboard api-keys CRUD
+    if (req.method === 'GET' && url.pathname === '/dashboard/api-keys') {
+      const dbClient = getDb();
+      if (!dbClient) return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      try {
+        const result = await dbClient.execute('SELECT id, provider, key_value, account_id, label, active, created_at FROM api_keys ORDER BY id');
+        const rows = result.rows.map((r: any) => ({ ...r, key_value: maskKey(String(r.key_value)) }));
+        return new Response(JSON.stringify(rows), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (err) {
+        return new Response(JSON.stringify([]), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/dashboard/api-keys') {
+      const dbClient = getDb();
+      if (!dbClient) return new Response(JSON.stringify({ error: 'Database unavailable' }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      try {
+        const body = await req.json() as { provider?: string; key_value?: string; account_id?: string; label?: string };
+        if (!body.provider || !body.key_value) {
+          return new Response(JSON.stringify({ error: { message: 'provider and key_value are required' } }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+        await dbClient.execute({
+          sql: `INSERT INTO api_keys (provider, key_value, account_id, label) VALUES (?, ?, ?, ?)`,
+          args: [body.provider, body.key_value, body.account_id || null, body.label || null],
+        });
+        return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (err) {
+        console.error('[Dashboard/api-keys POST]', err);
+        return new Response(JSON.stringify({ error: { message: 'Failed to save API key' } }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
+    const keysByIdMatch = url.pathname.match(/^\/dashboard\/api-keys\/(\d+)$/);
+    if (keysByIdMatch) {
+      const id = parseInt(keysByIdMatch[1]!);
+      const dbClient = getDb();
+      if (!dbClient) return new Response(JSON.stringify({ error: 'Database unavailable' }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      try {
+        if (req.method === 'PUT') {
+          const body = await req.json() as { provider?: string; key_value?: string; account_id?: string; label?: string; active?: number };
+          if (!body.provider || !body.key_value || body.active === undefined) {
+            return new Response(JSON.stringify({ error: { message: 'provider, key_value, and active are required' } }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+          }
+          await dbClient.execute({
+            sql: 'UPDATE api_keys SET provider=?, key_value=?, account_id=?, label=?, active=? WHERE id=?',
+            args: [body.provider, body.key_value, body.account_id || null, body.label || null, body.active, id],
+          });
+          return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+        if (req.method === 'DELETE') {
+          await dbClient.execute({ sql: 'DELETE FROM api_keys WHERE id=?', args: [id] });
+          return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+      } catch (err) {
+        console.error('[Dashboard/api-keys/:id]', err);
+        return new Response(JSON.stringify({ error: { message: 'Failed' } }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      }
+    }
+
     // --- SECURITY: Master Key Authentication ---
-    // Skip auth for health check (allows monitoring tools to work)
-    if (CONFIG.masterKey && url.pathname !== '/health') {
+    // Skip auth for health check and dashboard routes
+    if (CONFIG.masterKey && url.pathname !== '/health' && !url.pathname.startsWith('/dashboard')) {
       const authHeader = req.headers.get('Authorization');
       if (authHeader !== `Bearer ${CONFIG.masterKey}`) {
         return new Response(
@@ -830,7 +1085,13 @@ const server = Bun.serve({
         };
 
         const route: ResolvedRoute = resolveRoute(body.model);
-        const allowedProviders = route.providers;
+        let resolvedAllowedProviders: ReadonlySet<ProviderType> = route.providers;
+        const modelConfigProvider = body.model ? getCachedModelProvider(body.model) : undefined;
+        if (modelConfigProvider) {
+          resolvedAllowedProviders = new Set([modelConfigProvider]);
+          console.log(`[ModelConfig] Overriding route for '${body.model}' -> provider '${modelConfigProvider}'`);
+        }
+        const allowedProviders = resolvedAllowedProviders;
         const modelAliases = route.modelAliases;
         const configuredProviders = new Set(trackedServices.map(ts => ts.service.provider));
         const compatibleProviders = [...allowedProviders].filter(p => configuredProviders.has(p));
@@ -966,6 +1227,18 @@ const server = Bun.serve({
               tracked.metrics.totalLatencyMs += Date.now() - startTime;
               recordSuccess(tracked);
 
+              const usage = (completion as any)?.usage;
+              const originIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+              logUsage({
+                model: serviceOptions.model || service.name,
+                provider: service.provider,
+                tokensInput: usage?.prompt_tokens ?? 0,
+                tokensOutput: usage?.completion_tokens ?? 0,
+                durationMs: Date.now() - startTime,
+                success: 1,
+                originIp,
+              });
+
               return new Response(JSON.stringify(completion), {
                 headers: { 'Content-Type': 'application/json', ...corsHeaders },
               });
@@ -989,6 +1262,19 @@ const server = Bun.serve({
               tracked.metrics.lastErrorTime = Date.now();
               tracked.metrics.totalLatencyMs += Date.now() - startTime;
               recordFailure(tracked);
+
+              const failOriginIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+              logUsage({
+                model: serviceOptions.model || service.name,
+                provider: service.provider,
+                tokensInput: 0,
+                tokensOutput: 0,
+                durationMs: Date.now() - startTime,
+                success: 0,
+                errorMessage: errorMsg,
+                errorCode: status ? String(status) : undefined,
+                originIp: failOriginIp,
+              });
             }
           }
 
@@ -1183,6 +1469,17 @@ const server = Bun.serve({
                     tracked.metrics.successCount++;
                     tracked.metrics.totalLatencyMs += Date.now() - startTime;
                     recordSuccess(tracked);
+                    const streamUsage1 = (service as any).lastStreamUsage;
+                    const streamOriginIp1 = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+                    logUsage({
+                      model: streamOptions.model || service.name,
+                      provider: service.provider,
+                      tokensInput: streamUsage1?.prompt_tokens ?? 0,
+                      tokensOutput: streamUsage1?.completion_tokens ?? 0,
+                      durationMs: Date.now() - startTime,
+                      success: 1,
+                      originIp: streamOriginIp1,
+                    });
                     // Emit metadata for non-streaming response too
                     emitMetadata(
                       service,
@@ -1214,6 +1511,17 @@ const server = Bun.serve({
                     tracked.metrics.successCount++;
                     tracked.metrics.totalLatencyMs += Date.now() - startTime;
                     recordSuccess(tracked);
+                    const streamUsage2 = (service as any).lastStreamUsage;
+                    const streamOriginIp2 = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+                    logUsage({
+                      model: streamOptions.model || service.name,
+                      provider: service.provider,
+                      tokensInput: streamUsage2?.prompt_tokens ?? 0,
+                      tokensOutput: streamUsage2?.completion_tokens ?? 0,
+                      durationMs: Date.now() - startTime,
+                      success: 1,
+                      originIp: streamOriginIp2,
+                    });
                     break;
                   }
                 } catch (err) {
@@ -1238,6 +1546,19 @@ const server = Bun.serve({
                   tracked.metrics.lastErrorTime = Date.now();
                   tracked.metrics.totalLatencyMs += Date.now() - startTime;
                   recordFailure(tracked);
+
+                  const streamFailOriginIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+                  logUsage({
+                    model: streamOptions.model || service.name,
+                    provider: service.provider,
+                    tokensInput: 0,
+                    tokensOutput: 0,
+                    durationMs: Date.now() - startTime,
+                    success: 0,
+                    errorMessage: errorMsg,
+                    errorCode: status ? String(status) : undefined,
+                    originIp: streamFailOriginIp,
+                  });
 
                   if (started) break;
                 }

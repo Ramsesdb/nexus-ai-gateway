@@ -1,0 +1,1749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nexus Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg-deep: #070b16;
+            --bg-dark: #0a0a1a;
+            --bg-panel: rgba(16, 18, 36, 0.85);
+            --bg-card: rgba(24, 26, 52, 0.55);
+            --bg-card-hover: rgba(30, 33, 62, 0.7);
+            --bg-input: rgba(0, 0, 0, 0.45);
+            --bg-row: rgba(255, 255, 255, 0.015);
+            --bg-row-alt: rgba(255, 255, 255, 0.03);
+            --accent-primary: #00ff88;
+            --accent-blue: #00d4ff;
+            --accent-purple: #a855f7;
+            --accent-orange: #ff8c00;
+            --accent-red: #ff4757;
+            --accent-yellow: #ffd93d;
+            --accent-pink: #ff6b9d;
+            --text-primary: #f0f0f0;
+            --text-secondary: #8b8fa8;
+            --text-dim: #5a5d78;
+            --border: rgba(255, 255, 255, 0.07);
+            --border-active: rgba(255, 255, 255, 0.12);
+            --glass: rgba(255, 255, 255, 0.025);
+            --glass-hover: rgba(255, 255, 255, 0.05);
+            --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.4);
+            --radius-sm: 8px;
+            --radius: 12px;
+            --radius-lg: 16px;
+            --radius-xl: 20px;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg-deep);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background:
+                radial-gradient(ellipse 60% 50% at 50% 0%, rgba(0, 212, 255, 0.06), transparent 70%),
+                radial-gradient(ellipse 40% 60% at 85% 80%, rgba(168, 85, 247, 0.05), transparent 70%),
+                radial-gradient(ellipse 50% 50% at 15% 50%, rgba(0, 255, 136, 0.03), transparent 70%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        body::after {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(255, 255, 255, 0.015) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
+            background-size: 60px 60px;
+            pointer-events: none;
+            z-index: 0;
+            mask-image: radial-gradient(ellipse 60% 60% at 50% 50%, black 30%, transparent 70%);
+        }
+
+        /* ─── NAV BAR ──────────────────────── */
+        .navbar {
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            background: rgba(10, 12, 24, 0.9);
+            backdrop-filter: blur(24px) saturate(180%);
+            border-bottom: 1px solid var(--border);
+            padding: 0 28px;
+            height: 62px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .nav-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .nav-icon {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            box-shadow: 0 0 20px rgba(0, 212, 255, 0.25);
+        }
+
+        .nav-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-primary));
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .nav-subtitle {
+            font-size: 0.68rem;
+            color: var(--text-dim);
+            letter-spacing: 0.5px;
+            display: block;
+        }
+
+        .nav-right {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+        }
+
+        .nav-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+        }
+
+        .nav-status .dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: var(--accent-primary);
+            animation: pulse-dot 2s infinite;
+            box-shadow: 0 0 8px var(--accent-primary);
+        }
+
+        .nav-status .dot.error { background: var(--accent-red); box-shadow: 0 0 8px var(--accent-red); }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.85); }
+        }
+
+        .nav-refresh {
+            font-size: 0.72rem;
+            color: var(--text-dim);
+            font-family: 'Cascadia Code', 'Consolas', monospace;
+        }
+
+        .btn-refresh {
+            background: var(--glass);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 7px 14px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.75rem;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-refresh:hover { border-color: var(--accent-blue); color: var(--accent-blue); }
+
+        /* ─── TAB NAVIGATION ──────────────── */
+        .tab-bar {
+            display: flex;
+            gap: 2px;
+            padding: 18px 28px 0;
+            position: relative;
+            z-index: 10;
+        }
+
+        .tab-btn {
+            padding: 11px 24px;
+            background: transparent;
+            border: 1px solid transparent;
+            color: var(--text-dim);
+            font-size: 0.84rem;
+            font-weight: 500;
+            cursor: pointer;
+            border-radius: var(--radius) var(--radius) 0 0;
+            transition: all 0.25s;
+            position: relative;
+            letter-spacing: 0.3px;
+            display: flex;
+            align-items: center;
+            gap: 7px;
+        }
+
+        .tab-btn:hover { color: var(--text-secondary); background: var(--glass); }
+
+        .tab-btn.active {
+            color: var(--text-primary);
+            background: var(--bg-panel);
+            border-color: var(--border-active);
+            border-bottom-color: transparent;
+            box-shadow: 0 -2px 16px rgba(0, 212, 255, 0.06);
+        }
+
+        .tab-btn.active::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 20%;
+            right: 20%;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--accent-blue), transparent);
+            border-radius: 1px;
+        }
+
+        .tab-icon { font-size: 1rem; }
+
+        /* ─── MAIN CONTENT ────────────────── */
+        .main-content {
+            position: relative;
+            z-index: 10;
+            padding: 0 28px 40px;
+            max-width: 1500px;
+            margin: 0 auto;
+        }
+
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; animation: fadeSlideIn 0.35s ease; }
+
+        @keyframes fadeSlideIn {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* ─── PANEL / CARD ────────────────── */
+        .panel {
+            background: var(--bg-panel);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+        }
+
+        .panel-header {
+            padding: 16px 22px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.008);
+        }
+
+        .panel-header h3 {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            color: var(--text-secondary);
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .panel-header h3 .ico { font-size: 1rem; }
+
+        .panel-body { padding: 20px 22px; }
+
+        .panel-header .actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        /* ─── SECTION HEADING ─────────────── */
+        .section-title {
+            font-size: 0.73rem;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            color: var(--text-dim);
+            margin-bottom: 14px;
+            padding-left: 2px;
+            font-weight: 600;
+        }
+
+        /* ─── KPI CARDS ──────────────────── */
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+
+        .kpi-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px 22px;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s;
+            cursor: default;
+        }
+
+        .kpi-card:hover {
+            border-color: var(--border-active);
+            background: var(--bg-card-hover);
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-card);
+        }
+
+        .kpi-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+        }
+
+        .kpi-card.tokens::before { background: linear-gradient(90deg, var(--accent-blue), var(--accent-primary)); }
+        .kpi-card.requests::before { background: linear-gradient(90deg, var(--accent-purple), var(--accent-pink)); }
+        .kpi-card.errors::before { background: linear-gradient(90deg, var(--accent-red), var(--accent-orange)); }
+        .kpi-card.latency::before { background: linear-gradient(90deg, var(--accent-yellow), var(--accent-primary)); }
+
+        .kpi-icon {
+            font-size: 1.3rem;
+            margin-bottom: 10px;
+            display: block;
+        }
+
+        .kpi-value {
+            font-size: 2rem;
+            font-weight: 700;
+            line-height: 1;
+            margin-bottom: 4px;
+        }
+
+        .kpi-card.tokens .kpi-value { background: linear-gradient(90deg, var(--accent-blue), var(--accent-primary)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+        .kpi-card.requests .kpi-value { color: var(--accent-purple); }
+        .kpi-card.errors .kpi-value { color: var(--accent-red); }
+        .kpi-card.latency .kpi-value { color: var(--accent-yellow); }
+
+        .kpi-label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-dim);
+        }
+
+        .kpi-sub {
+            font-size: 0.72rem;
+            color: var(--text-secondary);
+            margin-top: 3px;
+        }
+
+        /* ─── CHARTS GRID ────────────────── */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+
+        .chart-box {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 18px;
+            position: relative;
+        }
+
+        .chart-box canvas { max-height: 280px; }
+
+        /* ─── TABLES ─────────────────────── */
+        .table-wrap {
+            overflow-x: auto;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.84rem;
+        }
+
+        table th {
+            text-align: left;
+            padding: 12px 16px;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            color: var(--text-dim);
+            background: rgba(255, 255, 255, 0.02);
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        table td {
+            padding: 11px 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+
+        table tbody tr { transition: background 0.15s; }
+        table tbody tr:nth-child(even) { background: var(--bg-row-alt); }
+        table tbody tr:hover { background: var(--glass-hover); }
+        table tbody tr:last-child td { border-bottom: none; }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 3px 10px;
+            border-radius: 10px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            letter-spacing: 0.4px;
+            gap: 5px;
+        }
+
+        .badge.active { background: rgba(0, 255, 136, 0.12); color: var(--accent-primary); }
+        .badge.inactive { background: rgba(255, 255, 255, 0.06); color: var(--text-dim); }
+        .badge.success { background: rgba(0, 255, 136, 0.12); color: var(--accent-primary); }
+        .badge.error { background: rgba(255, 71, 87, 0.12); color: var(--accent-red); }
+
+        .badge .badge-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .badge.active .badge-dot { background: var(--accent-primary); box-shadow: 0 0 6px var(--accent-primary); }
+        .badge.inactive .badge-dot { background: var(--text-dim); }
+        .badge.success .badge-dot { background: var(--accent-primary); }
+        .badge.error .badge-dot { background: var(--accent-red); }
+
+        /* ─── BUTTONS ────────────────────── */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 10px 18px;
+            border-radius: 8px;
+            border: 1px solid transparent;
+            font-size: 0.82rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            letter-spacing: 0.3px;
+            white-space: nowrap;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            color: #fff;
+            border: none;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 20px rgba(0, 212, 255, 0.3);
+        }
+
+        .btn-secondary {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+
+        .btn-secondary:hover {
+            border-color: var(--accent-blue);
+            color: var(--text-primary);
+            background: var(--bg-card-hover);
+        }
+
+        .btn-danger {
+            background: transparent;
+            border: 1px solid rgba(255, 71, 87, 0.3);
+            color: var(--accent-red);
+        }
+
+        .btn-danger:hover {
+            background: rgba(255, 71, 87, 0.1);
+            border-color: var(--accent-red);
+        }
+
+        .btn-sm { padding: 6px 12px; font-size: 0.73rem; border-radius: 6px; }
+        .btn-xs { padding: 4px 10px; font-size: 0.68rem; border-radius: 5px; }
+
+        .btn-ghost {
+            background: transparent;
+            border: none;
+            color: var(--text-dim);
+            padding: 6px 10px;
+        }
+
+        .btn-ghost:hover { color: var(--text-primary); }
+
+        /* ─── FORMS ──────────────────────── */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            color: var(--text-dim);
+            margin-bottom: 6px;
+            font-weight: 600;
+        }
+
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 11px 14px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-size: 0.88rem;
+            outline: none;
+            transition: all 0.2s;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 16px rgba(0, 212, 255, 0.12);
+        }
+
+        .form-group select { cursor: pointer; }
+        .form-group select option { background: #14162a; }
+
+        .form-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+
+        /* ─── MODALS ─────────────────────── */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(6px);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.2s ease;
+        }
+
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+        .modal {
+            background: var(--bg-panel);
+            border: 1px solid var(--border-active);
+            border-radius: var(--radius-lg);
+            width: 480px;
+            max-width: 95vw;
+            max-height: 85vh;
+            overflow-y: auto;
+            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+            animation: modalSlide 0.3s ease;
+        }
+
+        @keyframes modalSlide {
+            from { opacity: 0; transform: translateY(20px) scale(0.97); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .modal-header {
+            padding: 18px 22px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-header h3 { font-size: 0.95rem; }
+
+        .modal-body { padding: 22px; }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-dim);
+            font-size: 1.4rem;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+
+        .modal-close:hover { color: var(--text-primary); background: var(--glass); }
+
+        /* ─── PAGINATION / LOAD MORE ───── */
+        .pagination-row {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 14px;
+            padding: 18px 0 4px;
+        }
+
+        .page-info {
+            font-size: 0.78rem;
+            color: var(--text-dim);
+        }
+
+        /* ─── FILTERS ────────────────────── */
+        .filter-bar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+        }
+
+        .filter-chip {
+            padding: 6px 14px;
+            border-radius: 16px;
+            border: 1px solid var(--border);
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .filter-chip.active {
+            border-color: var(--accent-blue);
+            color: var(--accent-blue);
+            background: rgba(0, 212, 255, 0.08);
+        }
+
+        .filter-chip:hover { border-color: var(--border-active); }
+
+        .inline-select {
+            padding: 6px 12px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            color: var(--text-primary);
+            font-size: 0.75rem;
+            cursor: pointer;
+            outline: none;
+        }
+
+        .inline-select:focus { border-color: var(--accent-blue); }
+        .inline-select option { background: #14162a; }
+
+        /* ─── TOGGLE ─────────────────────── */
+        .toggle-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+        }
+
+        .toggle {
+            position: relative;
+            width: 40px;
+            height: 22px;
+        }
+
+        .toggle input { opacity: 0; width: 0; height: 0; }
+
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            inset: 0;
+            background: #333;
+            border-radius: 22px;
+            transition: 0.3s;
+        }
+
+        .toggle-slider::before {
+            content: '';
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            left: 3px;
+            bottom: 3px;
+            background: #fff;
+            border-radius: 50%;
+            transition: 0.3s;
+        }
+
+        .toggle input:checked + .toggle-slider { background: var(--accent-primary); }
+        .toggle input:checked + .toggle-slider::before { transform: translateX(18px); }
+
+        /* ─── EXPANDABLE ROW ────────────── */
+        .expanded-row td {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 14px 20px;
+            border-top: 1px solid rgba(255, 71, 87, 0.15);
+        }
+
+        .error-detail {
+            font-family: 'Cascadia Code', 'Consolas', monospace;
+            font-size: 0.78rem;
+            color: var(--accent-red);
+            white-space: pre-wrap;
+            word-break: break-all;
+            line-height: 1.5;
+            max-width: 600px;
+        }
+
+        .clickable-row { cursor: pointer; }
+
+        /* ─── EMPTY / LOADING ───────────── */
+        .empty-state {
+            text-align: center;
+            padding: 48px 20px;
+            color: var(--text-dim);
+        }
+
+        .empty-state .empty-icon { font-size: 2.5rem; margin-bottom: 12px; }
+
+        .loading-shimmer {
+            height: 16px;
+            background: linear-gradient(90deg, var(--glass) 25%, var(--glass-hover) 50%, var(--glass) 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.5s infinite;
+            border-radius: 4px;
+        }
+
+        @keyframes shimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent-blue);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ─── TOAST ──────────────────────── */
+        .toast-container {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .toast {
+            padding: 12px 20px;
+            border-radius: 8px;
+            font-size: 0.82rem;
+            font-weight: 500;
+            animation: toastIn 0.3s ease;
+            max-width: 380px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        }
+
+        .toast.success { background: rgba(0, 255, 136, 0.12); border: 1px solid rgba(0, 255, 136, 0.3); color: var(--accent-primary); }
+        .toast.error { background: rgba(255, 71, 87, 0.12); border: 1px solid rgba(255, 71, 87, 0.3); color: var(--accent-red); }
+
+        @keyframes toastIn {
+            from { opacity: 0; transform: translateX(30px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        /* ─── RESPONSIVE ─────────────────── */
+        @media (max-width: 1000px) {
+            .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+            .charts-grid { grid-template-columns: 1fr; }
+            .navbar { padding: 0 16px; }
+            .main-content { padding: 0 16px 24px; }
+            .tab-bar { padding: 12px 16px 0; gap: 0; }
+            .tab-btn { padding: 9px 14px; font-size: 0.76rem; }
+        }
+
+        @media (max-width: 600px) {
+            .kpi-grid { grid-template-columns: 1fr; }
+            .nav-subtitle { display: none; }
+            .nav-refresh { display: none; }
+            .tab-btn { padding: 8px 10px; font-size: 0.7rem; }
+            .tab-icon { font-size: 0.85rem; }
+        }
+
+        /* ─── SCROLLBAR ──────────────────── */
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
+
+        /* ─── CHART CONTAINERS ───────────── */
+        .chart-wrap { position: relative; width: 100%; }
+        .chart-wrap canvas { width: 100% !important; }
+    </style>
+</head>
+<body>
+    <!-- ─── NAV BAR ──────────────────────── -->
+    <nav class="navbar">
+        <div class="nav-brand">
+            <div class="nav-icon">⚡</div>
+            <div>
+                <span class="nav-title">Nexus Dashboard</span>
+                <span class="nav-subtitle">AI Gateway Monitoring</span>
+            </div>
+        </div>
+        <div class="nav-right">
+            <div class="nav-status">
+                <span class="dot" id="nav-dot"></span>
+                <span id="nav-status-text">Connecting…</span>
+            </div>
+            <span class="nav-refresh" id="nav-refresh-time">--:--:--</span>
+            <button class="btn-refresh" onclick="refreshAll()">
+                <span>↻</span> Refresh
+            </button>
+        </div>
+    </nav>
+
+    <!-- ─── TAB BAR ──────────────────────── -->
+    <div class="tab-bar" id="tab-bar">
+        <button class="tab-btn active" data-tab="overview"><span class="tab-icon">📊</span> Overview</button>
+        <button class="tab-btn" data-tab="usage"><span class="tab-icon">📈</span> Usage</button>
+        <button class="tab-btn" data-tab="models"><span class="tab-icon">🧩</span> Models</button>
+        <button class="tab-btn" data-tab="apikeys"><span class="tab-icon">🔑</span> API Keys</button>
+        <button class="tab-btn" data-tab="calls"><span class="tab-icon">📋</span> Call Log</button>
+    </div>
+
+    <!-- ─── MAIN CONTENT ─────────────────── -->
+    <div class="main-content">
+
+        <!-- TAB 1: OVERVIEW -->
+        <div class="tab-panel active" id="panel-overview">
+            <div class="kpi-grid">
+                <div class="kpi-card tokens">
+                    <span class="kpi-icon">⬡</span>
+                    <div class="kpi-value" id="kpi-tokens">--</div>
+                    <div class="kpi-label">Tokens Today</div>
+                    <div class="kpi-sub"><span id="kpi-tokens-in">--</span> in · <span id="kpi-tokens-out">--</span> out</div>
+                </div>
+                <div class="kpi-card requests">
+                    <span class="kpi-icon">⇄</span>
+                    <div class="kpi-value" id="kpi-requests">--</div>
+                    <div class="kpi-label">Requests Today</div>
+                    <div class="kpi-sub"><span id="kpi-requests-week">--</span> this week</div>
+                </div>
+                <div class="kpi-card errors">
+                    <span class="kpi-icon">⚠</span>
+                    <div class="kpi-value" id="kpi-errors">--</div>
+                    <div class="kpi-label">Errors Today</div>
+                    <div class="kpi-sub" style="color: var(--text-dim);">↓ keep it low</div>
+                </div>
+                <div class="kpi-card latency">
+                    <span class="kpi-icon">⏱</span>
+                    <div class="kpi-value" id="kpi-latency">--</div>
+                    <div class="kpi-label">Avg Latency</div>
+                    <div class="kpi-sub" style="color: var(--text-dim);">last 50 calls</div>
+                </div>
+            </div>
+
+            <div class="charts-grid">
+                <div class="chart-box">
+                    <h4 class="section-title">Tokens by Day <span style="font-weight:400;font-size:0.65rem;letter-spacing:0;">· 30 days</span></h4>
+                    <div class="chart-wrap"><canvas id="chart-tokens-daily"></canvas></div>
+                </div>
+                <div class="chart-box">
+                    <h4 class="section-title">Tokens by Model <span style="font-weight:400;font-size:0.65rem;letter-spacing:0;">· 30 days</span></h4>
+                    <div class="chart-wrap"><canvas id="chart-tokens-model"></canvas></div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <h3><span class="ico">🏆</span> Top Models by Usage</h3>
+                    <span style="font-size:0.72rem;color:var(--text-dim)">Last 30 days</span>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr><th>#</th><th>Model</th><th>Requests</th><th>Tokens In</th><th>Tokens Out</th><th>Total Tokens</th></tr>
+                        </thead>
+                        <tbody id="table-top-models"><tr><td colspan="6" class="empty-state"><div class="loading-shimmer" style="width:60%;margin:0 auto"></div></td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB 2: USAGE -->
+        <div class="tab-panel" id="panel-usage">
+            <div class="panel" style="margin-bottom:20px">
+                <div class="panel-header">
+                    <h3><span class="ico">📈</span> Token Usage Over Time</h3>
+                    <div class="actions">
+                        <select class="inline-select" id="usage-period" onchange="loadUsage()">
+                            <option value="7">7 days</option>
+                            <option value="14">14 days</option>
+                            <option value="30" selected>30 days</option>
+                        </select>
+                        <button class="filter-chip active" data-view="daily" onclick="setUsageView('daily')">Daily</button>
+                        <button class="filter-chip" data-view="weekly" onclick="setUsageView('weekly')">Weekly</button>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <div class="chart-wrap"><canvas id="chart-area-tokens" style="max-height:350px"></canvas></div>
+                </div>
+            </div>
+
+            <div class="charts-grid">
+                <div class="chart-box">
+                    <h4 class="section-title">Distribution by Model <span style="font-weight:400;font-size:0.65rem;letter-spacing:0;">· <span id="dist-period-label">30 days</span></span></h4>
+                    <div class="chart-wrap"><canvas id="chart-pie-model" style="max-height:260px"></canvas></div>
+                </div>
+                <div class="panel">
+                    <div class="panel-header">
+                        <h3><span class="ico">📋</span> Model Breakdown</h3>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>Model</th><th>Requests</th><th>Tokens In</th><th>Tokens Out</th><th>% Usage</th></tr></thead>
+                            <tbody id="table-usage-models"><tr><td colspan="5" class="empty-state"><div class="loading-shimmer" style="width:80%;margin:0 auto"></div></td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB 3: MODELS -->
+        <div class="tab-panel" id="panel-models">
+            <div class="panel">
+                <div class="panel-header">
+                    <h3><span class="ico">🧩</span> Registered Models</h3>
+                    <button class="btn btn-primary btn-sm" onclick="openModelModal()">＋ Add Model</button>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead><tr><th>Model Name</th><th>Provider</th><th>Status</th><th>Created</th><th style="width:120px">Actions</th></tr></thead>
+                        <tbody id="table-models"><tr><td colspan="5" class="empty-state"><div class="loading-shimmer" style="width:80%;margin:0 auto"></div></td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB 4: API KEYS -->
+        <div class="tab-panel" id="panel-apikeys">
+            <div class="panel">
+                <div class="panel-header">
+                    <h3><span class="ico">🔑</span> API Keys</h3>
+                    <button class="btn btn-primary btn-sm" onclick="openApiKeyModal()">＋ Add Key</button>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead><tr><th>Label</th><th>Provider</th><th>Key</th><th>Status</th><th>Created</th><th style="width:120px">Actions</th></tr></thead>
+                        <tbody id="table-apikeys"><tr><td colspan="6" class="empty-state"><div class="loading-shimmer" style="width:80%;margin:0 auto"></div></td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB 5: CALL LOG -->
+        <div class="tab-panel" id="panel-calls">
+            <div class="panel">
+                <div class="panel-header">
+                    <h3><span class="ico">📋</span> Recent Calls</h3>
+                    <div class="actions">
+                        <div class="toggle-row">
+                            <label class="toggle">
+                                <input type="checkbox" id="toggle-autorefresh" onchange="toggleAutoRefresh()">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <span>Auto</span>
+                        </div>
+                        <button class="btn btn-secondary btn-sm" onclick="loadCalls()">↻</button>
+                    </div>
+                </div>
+                <div style="padding:12px 22px 0">
+                    <div class="filter-bar">
+                        <button class="filter-chip active" data-status="all" onclick="setCallFilter('all')">All</button>
+                        <button class="filter-chip" data-status="success" onclick="setCallFilter('success')">Success</button>
+                        <button class="filter-chip" data-status="error" onclick="setCallFilter('error')">Errors</button>
+                    </div>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead><tr><th>Time</th><th>Model</th><th>Provider</th><th>Tokens In</th><th>Tokens Out</th><th>Duration</th><th>Status</th><th>Origin</th><th>Error</th></tr></thead>
+                        <tbody id="table-calls"><tr><td colspan="9" class="empty-state"><div class="loading-shimmer" style="width:80%;margin:0 auto"></div></td></tr></tbody>
+                    </table>
+                </div>
+                <div class="pagination-row" id="calls-pagination">
+                    <button class="btn btn-secondary btn-sm" id="btn-load-more" onclick="loadMoreCalls()">Load 50 More</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ─── MODAL CONTAINER ──────────────── -->
+    <div id="modal-container"></div>
+
+    <!-- ─── TOAST CONTAINER ─────────────── -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <!-- ─── CONFIRM DIALOG ──────────────── -->
+    <div id="confirm-dialog" style="display:none"></div>
+
+    <script>
+    (function() {
+    /* ── STATE ─────────────────────────── */
+    const AUTH_KEY = localStorage.getItem('nexus_master_key') || '';
+    let charts = {};
+    let usageView = 'daily';
+    let callFilter = 'all';
+    let callOffset = 0;
+    let autoRefreshTimer = null;
+    let summaryTimer = null;
+    let lastSummaryData = null;
+    let callTotal = 0;
+
+    /* ── HELPERS ───────────────────────── */
+    const fmt = (n) => n != null ? n.toLocaleString() : '--';
+    const fmtMs = (ms) => ms != null ? (ms >= 1000 ? (ms/1000).toFixed(1) + 's' : ms + 'ms') : '--';
+    const api = (path, opts = {}) => {
+        const url = `${path}`;
+        const headers = { 'Content-Type': 'application/json' };
+        if (AUTH_KEY) headers['Authorization'] = `Bearer ${AUTH_KEY}`;
+        return fetch(url, { headers, ...opts }).then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.json();
+        });
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    /* ── TAB NAVIGATION ────────────────── */
+    document.getElementById('tab-bar').addEventListener('click', e => {
+        const btn = e.target.closest('.tab-btn');
+        if (!btn) return;
+        const tab = btn.dataset.tab;
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        const panel = document.getElementById('panel-' + tab);
+        if (panel) panel.classList.add('active');
+        if (tab === 'overview') { loadSummary(); loadUsageData(); loadModelsUsage(); }
+        if (tab === 'usage') { loadUsage(); loadModelsUsage(); }
+        if (tab === 'models') loadModels();
+        if (tab === 'apikeys') loadApiKeys();
+        if (tab === 'calls') { callOffset = 0; loadCalls(); }
+    });
+
+    /* ── TOAST ─────────────────────────── */
+    function toast(msg, type = 'success') {
+        const c = $('toast-container');
+        const el = document.createElement('div');
+        el.className = 'toast ' + type;
+        el.textContent = msg;
+        c.appendChild(el);
+        setTimeout(() => { el.style.opacity = '0'; el.style.transform = 'translateX(30px)'; setTimeout(() => el.remove(), 300); }, 3500);
+    }
+
+    /* ── NAV STATUS ────────────────────── */
+    function setNavStatus(ok) {
+        const dot = $('nav-dot');
+        const txt = $('nav-status-text');
+        if (ok) { dot.classList.remove('error'); txt.textContent = 'Online'; }
+        else { dot.classList.add('error'); txt.textContent = 'Offline'; }
+    }
+
+    function updateRefreshTime() {
+        const now = new Date();
+        $('nav-refresh-time').textContent = now.toLocaleTimeString('en-US', { hour12: false });
+    }
+
+    /* ── DESTROY CHARTS ────────────────── */
+    function destroyChart(key) {
+        if (charts[key]) { charts[key].destroy(); delete charts[key]; }
+    }
+
+    /* ── CHART DEFAULTS ────────────────── */
+    Chart.defaults.color = '#8b8fa8';
+    Chart.defaults.borderColor = 'rgba(255,255,255,0.06)';
+    Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+
+    function chartOpts(xLabel = '', yLabel = '') {
+        return {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { labels: { color: '#8b8fa8', boxWidth: 12, padding: 16, font: { size: 11 }, usePointStyle: true } },
+                tooltip: {
+                    backgroundColor: 'rgba(16,18,36,0.95)',
+                    titleColor: '#f0f0f0',
+                    bodyColor: '#8b8fa8',
+                    borderColor: 'rgba(255,255,255,0.12)',
+                    borderWidth: 1,
+                    padding: 12,
+                    cornerRadius: 8,
+                }
+            },
+            scales: {
+                x: {
+                    ticks: { color: '#5a5d78', font: { size: 10 } },
+                    grid: { color: 'rgba(255,255,255,0.04)' },
+                },
+                y: {
+                    ticks: { color: '#5a5d78', font: { size: 10 } },
+                    grid: { color: 'rgba(255,255,255,0.04)' },
+                    beginAtZero: true,
+                }
+            },
+        };
+    }
+
+    /* ── COLORS ────────────────────────── */
+    const COLORS = ['#00d4ff','#a855f7','#00ff88','#ff8c00','#ff6b9d','#ffd93d','#ff4757','#14b8a6','#6366f1','#f59e0b'];
+
+    /* ══════════════════════════════════════
+       TAB 0: SHARED DATA LOADS
+       ══════════════════════════════════════ */
+
+    async function loadSummary() {
+        try {
+            const data = await api('/dashboard/summary');
+            lastSummaryData = data;
+            const total = (data.tokens_input_today || 0) + (data.tokens_output_today || 0);
+            $('kpi-tokens').textContent = fmt(total);
+            $('kpi-tokens-in').textContent = fmt(data.tokens_input_today);
+            $('kpi-tokens-out').textContent = fmt(data.tokens_output_today);
+            $('kpi-requests').textContent = fmt(data.requests_today);
+            $('kpi-requests-week').textContent = fmt(data.requests_week);
+            $('kpi-errors').textContent = fmt(data.errors_today);
+            setNavStatus(true);
+        } catch (e) {
+            console.error('loadSummary:', e);
+            setNavStatus(false);
+            if (!lastSummaryData) {
+                ['kpi-tokens','kpi-requests','kpi-errors','kpi-latency'].forEach(id => $(id).textContent = '--');
+            }
+        }
+        updateRefreshTime();
+    }
+
+    async function loadUsageData() {
+        try {
+            const data = await api('/dashboard/usage?period=daily&days=30');
+            destroyChart('tokensDaily');
+            const ctx = $('chart-tokens-daily').getContext('2d');
+            const labels = data.map(d => d.date.slice(5));
+            charts.tokensDaily = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels,
+                    datasets: [
+                        { label: 'Input', data: data.map(d => d.tokens_input), backgroundColor: 'rgba(0,212,255,0.3)', borderColor: '#00d4ff', borderWidth: 1, borderRadius: 3 },
+                        { label: 'Output', data: data.map(d => d.tokens_output), backgroundColor: 'rgba(0,255,136,0.25)', borderColor: '#00ff88', borderWidth: 1, borderRadius: 3 },
+                    ]
+                },
+                options: { ...chartOpts(), interaction: { mode: 'index' } }
+            });
+        } catch (e) { console.error('loadUsageData:', e); }
+    }
+
+    async function loadModelsUsage() {
+        try {
+            const days = parseInt($('usage-period')?.value || 30);
+            const periodLabel = days + ' days';
+            const dLabel = document.getElementById('dist-period-label');
+            if (dLabel) dLabel.textContent = periodLabel;
+
+            const data = await api('/dashboard/usage-by-model?days=' + days);
+            const top5 = data.slice(0, 5);
+
+            destroyChart('tokensModel');
+            const ctx = $('chart-tokens-model').getContext('2d');
+            const labels = top5.map(d => d.model);
+            charts.tokensModel = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels,
+                    datasets: [
+                        { label: 'Input', data: top5.map(d => d.tokens_input), backgroundColor: 'rgba(168,85,247,0.35)', borderColor: '#a855f7', borderWidth: 1, borderRadius: 3 },
+                        { label: 'Output', data: top5.map(d => d.tokens_output), backgroundColor: 'rgba(255,107,157,0.30)', borderColor: '#ff6b9d', borderWidth: 1, borderRadius: 3 },
+                    ]
+                },
+                options: {
+                    ...chartOpts(),
+                    indexAxis: 'y',
+                    scales: {
+                        x: { ticks: { color: '#5a5d78' }, grid: { color: 'rgba(255,255,255,0.04)' } },
+                        y: { ticks: { color: '#5a5d78' }, grid: { display: false } },
+                    }
+                }
+            });
+
+            const totalTokens = data.reduce((a, d) => a + d.tokens_input + d.tokens_output, 0);
+            const tbody = $('table-top-models');
+            if (top5.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><span class="empty-icon">📭</span><br>No usage data yet</td></tr>';
+            } else {
+                tbody.innerHTML = top5.map((d, i) => {
+                    const total = d.tokens_input + d.tokens_output;
+                    const pct = totalTokens ? ((total / totalTokens) * 100).toFixed(1) : 0;
+                    return `<tr>
+                        <td style="color:var(--text-dim)">${i + 1}</td>
+                        <td style="color:var(--text-primary);font-weight:500">${escHtml(d.model)}</td>
+                        <td>${fmt(d.requests)}</td>
+                        <td>${fmt(d.tokens_input)}</td>
+                        <td>${fmt(d.tokens_output)}</td>
+                        <td style="color:var(--accent-blue)">${fmt(total)} <span style="color:var(--text-dim);font-size:0.7rem">${pct}%</span></td>
+                    </tr>`;
+                }).join('');
+            }
+        } catch (e) { console.error('loadModelsUsage:', e); }
+    }
+
+    /* ══════════════════════════════════════
+       TAB 2: USAGE DETAILS
+       ══════════════════════════════════════ */
+
+    async function loadUsage() {
+        const days = parseInt($('usage-period').value || 30);
+        try {
+            const data = await api('/dashboard/usage?period=' + usageView + '&days=' + days);
+            destroyChart('areaTokens');
+            const ctx = $('chart-area-tokens').getContext('2d');
+            const labels = data.map(d => d.date.slice(usageView === 'weekly' ? 0 : 5));
+            charts.areaTokens = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [
+                        {
+                            label: 'Input Tokens',
+                            data: data.map(d => d.tokens_input),
+                            borderColor: '#00d4ff',
+                            backgroundColor: 'rgba(0,212,255,0.08)',
+                            fill: true,
+                            tension: 0.35,
+                            pointRadius: 2,
+                            pointBackgroundColor: '#00d4ff',
+                        },
+                        {
+                            label: 'Output Tokens',
+                            data: data.map(d => d.tokens_output),
+                            borderColor: '#00ff88',
+                            backgroundColor: 'rgba(0,255,136,0.05)',
+                            fill: true,
+                            tension: 0.35,
+                            pointRadius: 2,
+                            pointBackgroundColor: '#00ff88',
+                        },
+                        {
+                            label: 'Requests',
+                            data: data.map(d => d.requests * 100),
+                            borderColor: '#a855f7',
+                            backgroundColor: 'transparent',
+                            borderDash: [4, 4],
+                            tension: 0.35,
+                            pointRadius: 2,
+                            pointBackgroundColor: '#a855f7',
+                            yAxisID: 'y1',
+                        }
+                    ]
+                },
+                options: {
+                    ...chartOpts(),
+                    interaction: { mode: 'index', intersect: false },
+                    scales: {
+                        x: { ticks: { color: '#5a5d78' }, grid: { color: 'rgba(255,255,255,0.04)' } },
+                        y: {
+                            type: 'linear',
+                            position: 'left',
+                            ticks: { color: '#5a5d78' },
+                            grid: { color: 'rgba(255,255,255,0.04)' },
+                        },
+                        y1: {
+                            type: 'linear',
+                            position: 'right',
+                            ticks: {
+                                color: '#a855f7',
+                                callback: v => Math.round(v / 100),
+                            },
+                            grid: { display: false },
+                        }
+                    }
+                }
+            });
+        } catch (e) { console.error('loadUsage:', e); }
+
+        await loadModelsUsage();
+
+        // Pie chart
+        try {
+            const days2 = parseInt($('usage-period')?.value || 30);
+            const modelData = await api('/dashboard/usage-by-model?days=' + days2);
+            destroyChart('pieModel');
+            const pctx = $('chart-pie-model').getContext('2d');
+            const top = modelData.slice(0, 8);
+            const othersTokens = modelData.slice(8).reduce((a, d) => a + d.tokens_input + d.tokens_output, 0);
+            const pieLabels = top.map(d => d.model);
+            const pieValues = top.map(d => d.tokens_input + d.tokens_output);
+            if (othersTokens > 0) { pieLabels.push('Others'); pieValues.push(othersTokens); }
+
+            charts.pieModel = new Chart(pctx, {
+                type: 'doughnut',
+                data: {
+                    labels: pieLabels,
+                    datasets: [{ data: pieValues, backgroundColor: COLORS, borderColor: 'rgba(10,10,26,1)', borderWidth: 2 }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'right', labels: { color: '#8b8fa8', boxWidth: 12, padding: 12, font: { size: 10 }, usePointStyle: true } }
+                    }
+                }
+            });
+
+            // Model breakdown table
+            const tbody = $('table-usage-models');
+            const totalAll = modelData.reduce((a, d) => a + d.tokens_input + d.tokens_output, 0);
+            if (modelData.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No data</td></tr>';
+            } else {
+                tbody.innerHTML = modelData.map(d => {
+                    const t = d.tokens_input + d.tokens_output;
+                    const pct = totalAll ? ((t / totalAll) * 100).toFixed(1) : 0;
+                    return `<tr>
+                        <td style="color:var(--text-primary);font-weight:500">${escHtml(d.model)}</td>
+                        <td>${fmt(d.requests)}</td>
+                        <td>${fmt(d.tokens_input)}</td>
+                        <td>${fmt(d.tokens_output)}</td>
+                        <td><span style="color:var(--accent-blue)">${pct}%</span></td>
+                    </tr>`;
+                }).join('');
+            }
+        } catch (e) { console.error('loadUsage pie:', e); }
+    }
+
+    window.setUsageView = function(view) {
+        usageView = view;
+        document.querySelectorAll('#panel-usage .filter-chip[data-view]').forEach(c => c.classList.remove('active'));
+        document.querySelector('#panel-usage .filter-chip[data-view="' + view + '"]')?.classList.add('active');
+        loadUsage();
+    };
+
+    /* ══════════════════════════════════════
+       TAB 3: MODELS
+       ══════════════════════════════════════ */
+
+    async function loadModels() {
+        try {
+            const data = await api('/dashboard/models');
+            const tbody = $('table-models');
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><span class="empty-icon">📭</span><br>No models registered</td></tr>';
+            } else {
+                tbody.innerHTML = data.map(m => `
+                    <tr>
+                        <td style="color:var(--text-primary);font-weight:500">${escHtml(m.model_name)}</td>
+                        <td>${escHtml(m.provider)}</td>
+                        <td><span class="badge ${m.active ? 'active' : 'inactive'}"><span class="badge-dot"></span>${m.active ? 'Active' : 'Inactive'}</span></td>
+                        <td style="color:var(--text-dim)">${m.created_at ? new Date(m.created_at).toLocaleDateString() : '--'}</td>
+                        <td>
+                            <button class="btn btn-secondary btn-xs" onclick="openModelModal(${m.id}, '${escAttr(m.model_name)}', '${escAttr(m.provider)}', ${m.active})" title="Edit">✎</button>
+                            <button class="btn btn-danger btn-xs" onclick="confirmDelete('model', ${m.id}, '${escAttr(m.model_name)}')" title="Delete">✕</button>
+                        </td>
+                    </tr>
+                `).join('');
+            }
+        } catch (e) {
+            console.error('loadModels:', e);
+            $('table-models').innerHTML = '<tr><td colspan="5" class="empty-state">Failed to load models</td></tr>';
+        }
+    }
+
+    window.openModelModal = function(id, modelName = '', provider = '', active = true) {
+        const isEdit = id != null;
+        const providers = ['groq', 'openrouter', 'cerebras', 'gemini', 'deepseek', 'openai', 'anthropic'];
+        const html = `
+            <div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+                <div class="modal">
+                    <div class="modal-header">
+                        <h3>${isEdit ? 'Edit Model' : 'Add Model'}</h3>
+                        <button class="modal-close" onclick="closeModal()">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="form-group">
+                            <label>Model Name</label>
+                            <input type="text" id="mf-model-name" placeholder="e.g. llama-4-scout" value="${escAttr(modelName)}">
+                        </div>
+                        <div class="form-group">
+                            <label>Provider</label>
+                            <select id="mf-provider">${providers.map(p => `<option value="${p}" ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex;align-items:center;gap:8px">
+                                <input type="checkbox" id="mf-active" ${active ? 'checked' : ''}> Active
+                            </label>
+                        </div>
+                        <div class="form-actions">
+                            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                            <button class="btn btn-primary" id="btn-save-model">${isEdit ? 'Update' : 'Create'}</button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        $('modal-container').innerHTML = html;
+        $('btn-save-model').onclick = async () => {
+            const body = {
+                model_name: $('mf-model-name').value.trim(),
+                provider: $('mf-provider').value,
+                active: $('mf-active').checked ? 1 : 0,
+            };
+            if (!body.model_name) return toast('Model name is required', 'error');
+            try {
+                const method = isEdit ? 'PUT' : 'POST';
+                const url = isEdit ? `/dashboard/models/${id}` : '/dashboard/models';
+                const res = await fetch(url, {
+                    method,
+                    headers: { 'Content-Type': 'application/json', ...(AUTH_KEY ? { 'Authorization': `Bearer ${AUTH_KEY}` } : {}) },
+                    body: JSON.stringify(body),
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                toast(isEdit ? 'Model updated' : 'Model created');
+                closeModal();
+                loadModels();
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        };
+    };
+
+    /* ══════════════════════════════════════
+       TAB 4: API KEYS
+       ══════════════════════════════════════ */
+
+    async function loadApiKeys() {
+        try {
+            const data = await api('/dashboard/api-keys');
+            const tbody = $('table-apikeys');
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><span class="empty-icon">📭</span><br>No API keys registered</td></tr>';
+            } else {
+                tbody.innerHTML = data.map(k => `
+                    <tr>
+                        <td style="color:var(--text-primary);font-weight:500">${escHtml(k.label || '—')}</td>
+                        <td>${escHtml(k.provider)}</td>
+                        <td style="font-family:'Cascadia Code',Consolas,monospace;font-size:0.78rem">${escHtml(k.key_masked)}</td>
+                        <td><span class="badge ${k.active ? 'active' : 'inactive'}"><span class="badge-dot"></span>${k.active ? 'Active' : 'Inactive'}</span></td>
+                        <td style="color:var(--text-dim)">${k.created_at ? new Date(k.created_at).toLocaleDateString() : '--'}</td>
+                        <td>
+                            <button class="btn btn-secondary btn-xs" onclick="openApiKeyModal(${k.id}, '${escAttr(k.provider)}', '${escAttr(k.label || '')}', '${escAttr(k.account_id || '')}', ${k.active})" title="Edit">✎</button>
+                            <button class="btn btn-danger btn-xs" onclick="confirmDelete('apikey', ${k.id}, '${escAttr(k.label || k.key_masked)}')" title="Delete">✕</button>
+                        </td>
+                    </tr>
+                `).join('');
+            }
+        } catch (e) {
+            console.error('loadApiKeys:', e);
+            $('table-apikeys').innerHTML = '<tr><td colspan="6" class="empty-state">Failed to load API keys</td></tr>';
+        }
+    }
+
+    window.openApiKeyModal = function(id, provider = '', label = '', accountId = '', active = true) {
+        const isEdit = id != null;
+        const providers = ['groq', 'openrouter', 'cerebras', 'gemini', 'deepseek', 'openai', 'anthropic'];
+        const html = `
+            <div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+                <div class="modal">
+                    <div class="modal-header">
+                        <h3>${isEdit ? 'Edit API Key' : 'Add API Key'}</h3>
+                        <button class="modal-close" onclick="closeModal()">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="form-group">
+                            <label>Label</label>
+                            <input type="text" id="mkf-label" placeholder="e.g. Groq Production" value="${escAttr(label)}">
+                        </div>
+                        <div class="form-group">
+                            <label>Provider</label>
+                            <select id="mkf-provider">${providers.map(p => `<option value="${p}" ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
+                        </div>
+                        <div class="form-group">
+                            <label>Key Value ${isEdit ? '(leave blank to keep current)' : ''}</label>
+                            <input type="password" id="mkf-value" placeholder="sk-...">
+                        </div>
+                        <div class="form-group">
+                            <label>Account ID <span style="font-weight:400;color:var(--text-dim)">(optional)</span></label>
+                            <input type="text" id="mkf-account" placeholder="account identifier" value="${escAttr(accountId)}">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex;align-items:center;gap:8px">
+                                <input type="checkbox" id="mkf-active" ${active ? 'checked' : ''}> Active
+                            </label>
+                        </div>
+                        <div class="form-actions">
+                            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                            <button class="btn btn-primary" id="btn-save-key">${isEdit ? 'Update' : 'Create'}</button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        $('modal-container').innerHTML = html;
+        $('btn-save-key').onclick = async () => {
+            const body = {
+                provider: $('mkf-provider').value,
+                key_value: $('mkf-value').value.trim(),
+                label: $('mkf-label').value.trim() || null,
+                account_id: $('mkf-account').value.trim() || null,
+                active: $('mkf-active').checked ? 1 : 0,
+            };
+            if (!body.provider) return toast('Provider is required', 'error');
+            if (!isEdit && !body.key_value) return toast('Key value is required', 'error');
+            if (isEdit && !body.key_value) delete body.key_value;
+            try {
+                const method = isEdit ? 'PUT' : 'POST';
+                const url = isEdit ? `/dashboard/api-keys/${id}` : '/dashboard/api-keys';
+                const res = await fetch(url, {
+                    method,
+                    headers: { 'Content-Type': 'application/json', ...(AUTH_KEY ? { 'Authorization': `Bearer ${AUTH_KEY}` } : {}) },
+                    body: JSON.stringify(body),
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                toast(isEdit ? 'API key updated' : 'API key created');
+                closeModal();
+                loadApiKeys();
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        };
+    };
+
+    /* ══════════════════════════════════════
+       CONFIRM DELETE
+       ══════════════════════════════════════ */
+
+    window.confirmDelete = function(type, id, name) {
+        const html = `
+            <div class="modal-overlay" onclick="if(event.target===this)closeModal()">
+                <div class="modal" style="width:400px">
+                    <div class="modal-header">
+                        <h3>Confirm Delete</h3>
+                        <button class="modal-close" onclick="closeModal()">×</button>
+                    </div>
+                    <div class="modal-body">
+                        <p style="margin-bottom:16px;color:var(--text-secondary)">Are you sure you want to delete <strong style="color:var(--text-primary)">${escHtml(name)}</strong>?</p>
+                        <p style="font-size:0.78rem;color:var(--accent-red);margin-bottom:16px">This action cannot be undone.</p>
+                        <div class="form-actions">
+                            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                            <button class="btn btn-danger" id="btn-confirm-delete">Delete</button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        $('modal-container').innerHTML = html;
+        $('btn-confirm-delete').onclick = async () => {
+            try {
+                const url = type === 'model' ? `/dashboard/models/${id}` : `/dashboard/api-keys/${id}`;
+                const res = await fetch(url, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json', ...(AUTH_KEY ? { 'Authorization': `Bearer ${AUTH_KEY}` } : {}) },
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                toast('Deleted successfully');
+                closeModal();
+                if (type === 'model') loadModels();
+                else loadApiKeys();
+            } catch (e) {
+                toast('Error: ' + e.message, 'error');
+            }
+        };
+    };
+
+    window.closeModal = function() { $('modal-container').innerHTML = ''; };
+
+    /* ══════════════════════════════════════
+       TAB 5: CALL LOG
+       ══════════════════════════════════════ */
+
+    window.setCallFilter = function(status) {
+        callFilter = status;
+        callOffset = 0;
+        document.querySelectorAll('#panel-calls .filter-chip').forEach(c => c.classList.remove('active'));
+        document.querySelector(`#panel-calls .filter-chip[data-status="${status}"]`)?.classList.add('active');
+        loadCalls();
+    };
+
+    async function loadCalls(append = false) {
+        if (!append) callOffset = 0;
+        const url = `/dashboard/calls?limit=50&offset=${callOffset}`;
+        try {
+            const data = await api(url);
+            const tbody = $('table-calls');
+            if (!append) tbody.innerHTML = '';
+
+            let filtered = data;
+            if (callFilter === 'success') filtered = data.filter(c => c.success);
+            if (callFilter === 'error') filtered = data.filter(c => !c.success);
+
+            if (filtered.length === 0 && !append) {
+                tbody.innerHTML = '<tr><td colspan="9" class="empty-state"><span class="empty-icon">📭</span><br>No calls found</td></tr>';
+            } else {
+                tbody.innerHTML += filtered.map(c => {
+                    const time = new Date(c.timestamp);
+                    const isErr = !c.success;
+                    return `
+                        <tr class="clickable-row ${isErr ? 'expanded-parent' : ''}" data-call-id="${c.id}" onclick="toggleCallDetail(this, ${c.id})">
+                            <td style="color:var(--text-dim);font-size:0.78rem">${time.toLocaleString('en-US', { hour12: false })}</td>
+                            <td style="color:var(--text-primary)">${escHtml(c.model)}</td>
+                            <td>${escHtml(c.provider)}</td>
+                            <td>${fmt(c.tokens_input)}</td>
+                            <td>${fmt(c.tokens_output)}</td>
+                            <td>${fmtMs(c.duration_ms)}</td>
+                            <td><span class="badge ${isErr ? 'error' : 'success'}"><span class="badge-dot"></span>${isErr ? 'Error' : 'OK'}</span></td>
+                            <td style="font-family:monospace;font-size:0.75rem">${escHtml(c.origin_ip || '—')}</td>
+                            <td style="color:${isErr ? 'var(--accent-red)' : 'var(--text-dim)'}">${isErr ? '⚠' : '—'}</td>
+                        </tr>
+                        <tr class="call-detail" id="call-detail-${c.id}" style="display:none">
+                            ${isErr ? `<td colspan="9" class="expanded-row">
+                                <div class="error-detail">${escHtml(c.error_message || 'No error message')}</div>
+                                ${c.error_code ? `<div style="color:var(--text-dim);margin-top:4px;font-size:0.7rem">Code: ${escHtml(c.error_code)}</div>` : ''}
+                            </td>` : '<td colspan="9" style="color:var(--text-dim);padding:10px 20px">Request completed successfully</td>'}
+                        </tr>`;
+                }).join('');
+
+                callTotal += filtered.length;
+                if (filtered.length < 50) {
+                    $('btn-load-more').style.display = 'none';
+                } else {
+                    $('btn-load-more').style.display = '';
+                    $('btn-load-more').textContent = 'Load 50 More';
+                }
+            }
+
+            // Compute average latency
+            if (!append && data.length > 0) {
+                const latencies = data.filter(c => c.duration_ms != null).map(c => c.duration_ms);
+                if (latencies.length > 0) {
+                    const avg = Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length);
+                    $('kpi-latency').textContent = fmtMs(avg);
+                }
+            }
+        } catch (e) {
+            console.error('loadCalls:', e);
+            if (!append) $('table-calls').innerHTML = '<tr><td colspan="9" class="empty-state">Failed to load calls</td></tr>';
+        }
+    }
+
+    window.toggleCallDetail = function(row, id) {
+        const detail = document.getElementById('call-detail-' + id);
+        if (detail) {
+            detail.style.display = detail.style.display === 'none' ? '' : 'none';
+        }
+    };
+
+    window.loadMoreCalls = function() {
+        callOffset += 50;
+        loadCalls(true);
+    };
+
+    /* ══════════════════════════════════════
+       AUTO REFRESH
+       ══════════════════════════════════════ */
+
+    window.toggleAutoRefresh = function() {
+        if ($('toggle-autorefresh').checked) {
+            autoRefreshTimer = setInterval(() => {
+                callOffset = 0;
+                loadCalls();
+            }, 10000);
+        } else {
+            clearInterval(autoRefreshTimer);
+        }
+    };
+
+    /* ══════════════════════════════════════
+       GLOBAL REFRESH
+       ══════════════════════════════════════ */
+
+    window.refreshAll = function() {
+        loadSummary();
+        const activePanel = document.querySelector('.tab-panel.active');
+        if (activePanel) {
+            const id = activePanel.id;
+            if (id === 'panel-overview') { loadUsageData(); loadModelsUsage(); }
+            if (id === 'panel-usage') loadUsage();
+            if (id === 'panel-models') loadModels();
+            if (id === 'panel-apikeys') loadApiKeys();
+            if (id === 'panel-calls') { callOffset = 0; loadCalls(); }
+        }
+        updateRefreshTime();
+    };
+
+    /* ══════════════════════════════════════
+       UTILS
+       ══════════════════════════════════════ */
+
+    function escHtml(s) {
+        if (s == null) return '';
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function escAttr(s) {
+        if (s == null) return '';
+        return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    /* ══════════════════════════════════════
+       INIT
+       ══════════════════════════════════════ */
+
+    loadSummary();
+    loadUsageData();
+    loadModelsUsage();
+
+    // Auto-refresh summary every 10s
+    summaryTimer = setInterval(() => {
+        loadSummary();
+        // also refresh usage data in background if overview tab is active
+        const overviewPanel = document.getElementById('panel-overview');
+        if (overviewPanel && overviewPanel.classList.contains('active')) {
+            loadUsageData();
+            loadModelsUsage();
+        }
+    }, 10000);
+
+    })();
+    </script>
+</body>
+</html>
