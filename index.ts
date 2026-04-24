@@ -7,6 +7,7 @@ import { GroqService } from './services/groq';
 import { GeminiService } from './services/gemini';
 import { OpenRouterService } from './services/openrouter';
 import { CerebrasService } from './services/cerebras';
+import { CloudflareService } from './services/cloudflare';
 import { resolveRoute, type ResolvedRoute } from './services/router';
 import type {
   AIService,
@@ -81,12 +82,13 @@ interface ProviderKeyConfig {
 
 const collectProviderKeys = (): ProviderKeyConfig[] => {
   // Provider priority for load balancing (higher = preferred)
-  // Strategy: Cerebras (fastest) > Groq (reliable) > OpenRouter (free) > Gemini (avoid abuse blocks)
+  // Strategy: Cerebras (fastest) > Groq (reliable) > Cloudflare (edge) > OpenRouter (free) > Gemini (avoid abuse blocks)
   const providerPriorityOrder: Record<ProviderType, number> = {
-    cerebras: 10,  // Best free tier: 1M tokens/day, 2000+ tok/s
-    groq: 8,       // Reliable backup: 500+ tok/s
-    openrouter: 6, // Free tier backup
-    gemini: 2,     // LAST RESORT - can block for abuse from same IP
+    cerebras: 10,   // Best free tier: 1M tokens/day, 2000+ tok/s
+    groq: 8,        // Reliable backup: 500+ tok/s
+    cloudflare: 7,  // Workers AI: ~400ms latency, 10K neurons/day
+    openrouter: 6,  // Free tier backup
+    gemini: 2,      // LAST RESORT - can block for abuse from same IP
   };
 
   const patterns = [
@@ -94,10 +96,12 @@ const collectProviderKeys = (): ProviderKeyConfig[] => {
     { provider: 'gemini' as ProviderType, prefix: 'GEMINI_KEY_', priority: 2 },
     { provider: 'openrouter' as ProviderType, prefix: 'OPENROUTER_KEY_', priority: 2 },
     { provider: 'cerebras' as ProviderType, prefix: 'CEREBRAS_KEY_', priority: 2 },
+    { provider: 'cloudflare' as ProviderType, prefix: 'CLOUDFLARE_KEY_', priority: 2 },
     { provider: 'groq' as ProviderType, prefix: 'GROQ_API_KEY_', priority: 1 },
     { provider: 'gemini' as ProviderType, prefix: 'GEMINI_API_KEY_', priority: 1 },
     { provider: 'openrouter' as ProviderType, prefix: 'OPENROUTER_API_KEY_', priority: 1 },
     { provider: 'cerebras' as ProviderType, prefix: 'CEREBRAS_API_KEY_', priority: 1 },
+    { provider: 'cloudflare' as ProviderType, prefix: 'CLOUDFLARE_API_KEY_', priority: 1 },
   ];
 
   const chosen = new Map<string, ProviderKeyConfig>();
@@ -145,6 +149,8 @@ const createService = (config: ProviderKeyConfig): AIService => {
       return new OpenRouterService(config.apiKey, config.instanceId);
     case 'cerebras':
       return new CerebrasService(config.apiKey, config.instanceId);
+    case 'cloudflare':
+      return new CloudflareService(config.apiKey, config.instanceId);
     default:
       throw new Error(`Unknown provider: ${config.provider}`);
   }
@@ -343,16 +349,18 @@ const calculateHealthScore = (tracked: EnhancedTrackedService): number => {
 
   // Provider priority bonus (ensures preferred providers are selected when scores are similar)
   const priorityBonus: Record<ProviderType, number> = {
-    cerebras: 0.15,   // Highest priority: fastest, best free tier
-    groq: 0.10,       // Second priority: reliable
-    openrouter: 0.05, // Third priority: free backup
-    gemini: 0.00,     // Last resort: can block for abuse
+    cerebras: 0.15,    // Highest priority: fastest, best free tier
+    groq: 0.10,        // Second priority: reliable
+    cloudflare: 0.075, // Third priority: edge inference, ~400ms latency
+    openrouter: 0.05,  // Fourth priority: free backup
+    gemini: 0.00,      // Last resort: can block for abuse
   };
   const providerName = service.name.toLowerCase();
   const bonus = providerName.includes('cerebras') ? priorityBonus.cerebras :
     providerName.includes('groq') ? priorityBonus.groq :
-      providerName.includes('openrouter') ? priorityBonus.openrouter :
-        priorityBonus.gemini;
+      providerName.includes('cloudflare') ? priorityBonus.cloudflare :
+        providerName.includes('openrouter') ? priorityBonus.openrouter :
+          priorityBonus.gemini;
 
   if (metrics.totalRequests < CONFIG.minRequestsForScoring) {
     return 0.5 + bonus; // Base score + priority bonus

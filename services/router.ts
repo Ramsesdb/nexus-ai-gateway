@@ -82,6 +82,10 @@ const RULES: PrefixRule[] = [
   { label: 'zai/*',         test: starts('zai/'),         providers: ['cerebras'] },
   { label: 'cerebras/*',    test: starts('cerebras/'),    providers: ['cerebras'] },
   { label: 'glm-*',         test: starts('glm-'),         providers: ['cerebras', 'openrouter'] },
+
+  // Cloudflare Workers AI models use the mandatory @cf/ prefix
+  { label: '@cf/*',         test: starts('@cf/'),         providers: ['cloudflare'] },
+  { label: 'cloudflare/*',  test: starts('cloudflare/'),  providers: ['cloudflare'] },
 ];
 
 export interface ResolvedRoute {
@@ -113,7 +117,7 @@ export interface ResolvedRoute {
   stripModel?: boolean;
 }
 
-const ALL_PROVIDERS: ProviderType[] = ['groq', 'gemini', 'openrouter', 'cerebras'];
+const ALL_PROVIDERS: ProviderType[] = ['groq', 'gemini', 'openrouter', 'cerebras', 'cloudflare'];
 
 /**
  * Resolve which providers can serve a given model string.
@@ -149,7 +153,7 @@ export function resolveRoute(model?: string): ResolvedRoute {
   const pinMatch = model.trim().match(/^(\w+)\s+\(Key\s+#(\d+)\)$/i);
   if (pinMatch) {
     const providerName = pinMatch[1]!.toLowerCase();
-    if (providerName === 'groq' || providerName === 'openrouter' || providerName === 'gemini' || providerName === 'cerebras') {
+    if (providerName === 'groq' || providerName === 'openrouter' || providerName === 'gemini' || providerName === 'cerebras' || providerName === 'cloudflare') {
       return {
         providers: new Set([providerName as ProviderType]),
         isUniversal: false,

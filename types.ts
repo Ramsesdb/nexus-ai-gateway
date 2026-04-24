@@ -84,7 +84,7 @@ export interface AIService {
 
 // --- PROVIDER TYPES ---
 
-export type ProviderType = 'groq' | 'gemini' | 'openrouter' | 'cerebras';
+export type ProviderType = 'groq' | 'gemini' | 'openrouter' | 'cerebras' | 'cloudflare';
 
 /**
  * Optional chat completion params (OpenAI-compatible subset)
