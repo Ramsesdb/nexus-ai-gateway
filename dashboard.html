@@ -742,9 +742,33 @@
     return Math.round(n) + 'ms';
   }
   function fmtRel(date) {
-    const d = (date instanceof Date) ? date : new Date(date);
-    const diff = (Date.now() - d.getTime()) / 1000;
-    if (diff < 60) return Math.max(1, Math.round(diff)) + 's ago';
+    let d;
+    if (date instanceof Date) {
+      d = date;
+    } else if (typeof date === 'number') {
+      // Heuristic: if it looks like seconds (10-digit), promote to ms.
+      d = new Date(date < 1e12 ? date * 1000 : date);
+    } else if (typeof date === 'string') {
+      // Server often returns "YYYY-MM-DD HH:MM:SS" or ISO without zone -> assume UTC.
+      const s = date.trim();
+      const naive = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s);
+      d = new Date(naive ? s.replace(' ', 'T') + 'Z' : s);
+    } else {
+      d = new Date(date);
+    }
+    if (!d || isNaN(d.getTime())) return '—';
+    let diff = (Date.now() - d.getTime()) / 1000;
+    // Tolerate small clock skew where server time is slightly ahead of client.
+    if (diff < 0 && diff > -60) diff = 0;
+    if (diff < 0) {
+      const fwd = -diff;
+      if (fwd < 60) return 'in ' + Math.round(fwd) + 's';
+      if (fwd < 3600) return 'in ' + Math.round(fwd / 60) + 'm';
+      if (fwd < 86400) return 'in ' + Math.round(fwd / 3600) + 'h';
+      return 'in ' + Math.round(fwd / 86400) + 'd';
+    }
+    if (diff < 1) return 'just now';
+    if (diff < 60) return Math.round(diff) + 's ago';
     if (diff < 3600) return Math.round(diff / 60) + 'm ago';
     if (diff < 86400) return Math.round(diff / 3600) + 'h ago';
     return Math.round(diff / 86400) + 'd ago';
