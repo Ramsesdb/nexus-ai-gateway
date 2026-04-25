@@ -1112,14 +1112,22 @@ const server = Bun.serve({
 
         const route: ResolvedRoute = resolveRoute(body.model);
         let resolvedAllowedProviders: ReadonlySet<ProviderType> = route.providers;
-        const modelConfigProvider = body.model ? getCachedModelProvider(body.model) : undefined;
-        if (modelConfigProvider) {
+        const configuredProviders = new Set(trackedServices.map(ts => ts.service.provider));
+        // Skip the model_config override for the 'auto' pseudo-model (the router
+        // already returns the full universal fallback set with stripModel=true)
+        // and for any cached entry whose provider isn't actually configured —
+        // otherwise a stale row like ('auto','auto') would narrow the route to
+        // a phantom provider and yield "No compatible provider configured".
+        const isAutoPseudoModel = typeof body.model === 'string' && body.model.trim().toLowerCase() === 'auto';
+        const modelConfigProvider = body.model && !isAutoPseudoModel ? getCachedModelProvider(body.model) : undefined;
+        if (modelConfigProvider && configuredProviders.has(modelConfigProvider)) {
           resolvedAllowedProviders = new Set([modelConfigProvider]);
           console.log(`[ModelConfig] Overriding route for '${body.model}' -> provider '${modelConfigProvider}'`);
+        } else if (modelConfigProvider) {
+          console.warn(`[ModelConfig] Ignoring stale model_config row '${body.model}' -> '${modelConfigProvider}' (provider not configured); falling back to router route '${route.ruleLabel}'`);
         }
         const allowedProviders = resolvedAllowedProviders;
         const modelAliases = route.modelAliases;
-        const configuredProviders = new Set(trackedServices.map(ts => ts.service.provider));
         const compatibleProviders = [...allowedProviders].filter(p => configuredProviders.has(p));
         const candidateList = trackedServices
           .filter(ts => allowedProviders.has(ts.service.provider))

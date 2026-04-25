@@ -148,10 +148,15 @@ export function seedModels(pool: TrackedService[]): void {
         args: [modelName, provider],
       }).catch(err => console.error(`[Database] seedModels failed for ${provider}:`, err));
     }
+    // Note: 'auto' is a pseudo-model handled by the router (services/router.ts).
+    // It must NOT live in model_config — getCachedModelProvider('auto') would
+    // override the router's universal-fallback route with the bogus provider
+    // string 'auto', which matches no tracked service and yields a 400.
+    // Clean up any stale row from earlier builds that did seed it.
     db.execute({
-      sql: "INSERT OR IGNORE INTO model_config (model_name, provider) VALUES ('auto', 'auto')",
+      sql: "DELETE FROM model_config WHERE model_name = 'auto'",
       args: [],
-    }).catch(err => console.error('[Database] seedModels failed for auto:', err));
+    }).catch(err => console.error('[Database] seedModels cleanup of stale auto row failed:', err));
   } catch (err) {
     console.error('[Database] seedModels error:', err);
   }
