@@ -269,14 +269,47 @@
   @media (max-width: 1024px) { .grid-cards-2 { grid-template-columns: 1fr; } }
 
   /* Charts
-     IMPORTANT: do NOT set canvas width/height with !important here. Chart.js
-     manages the canvas size itself when `responsive: true` + `maintainAspectRatio: false`,
-     and forcing 100%/!important breaks its internal device-pixel-ratio
-     scaling — which in turn breaks pointer→data-coordinate conversion (so
-     tooltips never fire). The chart-box height below provides the layout
-     box Chart.js measures. */
-  .chart-box { padding: 12px 16px 16px; height: 268px; min-height: 268px; position: relative; }
+     Chart.js v4 with `responsive: true` measures the canvas's PARENT element
+     and writes back inline `style.width`/`style.height` (CSS pixels) on the
+     canvas every resize tick. So the parent must have a definite, non-zero
+     box size at construction time, and the canvas must be a normal block-flow
+     child whose intrinsic 300×150 fallback never gets used.
+
+     The trap the previous fix fell into: removing the `width:100% !important`
+     rule was correct for tooltip hit-testing, BUT nothing replaced it, so the
+     canvas reverted to `display: inline` with a 300×150 intrinsic size. On
+     tab swap, the rAF construction would sometimes win the race and Chart.js
+     would size it correctly (the 300×150 attribute size still gets overridden
+     by inline style.width in pixels) — but if the .grid-2 column had not yet
+     resolved its fr-track width when the rAF fired, Chart.js measured the
+     parent at 0×N or N×0 and produced an invisible chart. Even worse, the
+     inline canvas baseline alignment introduced sub-pixel whitespace that
+     could collapse the box.
+
+     The fix:
+       1. .chart-box owns the layout (fixed height, position:relative).
+       2. Inner .chart-canvas-wrap is the SIZING parent Chart.js measures,
+          absolutely positioned to inset:0 so it always has the chart-box's
+          inner dimensions immediately on insertion (no fr-track race).
+       3. canvas is display:block so no inline whitespace.
+       4. We keep Chart.js fully in control of the canvas's own width/height
+          (no !important), preserving DPR-aware tooltip hit testing. */
+  .chart-box {
+    /* Padding is intentionally NOT on this element: padding has no effect on
+       the absolutely-positioned .chart-canvas-wrap inside, so we apply the
+       breathing room via the wrap's `inset` instead — this also guarantees
+       the wrap reports a deterministic size to Chart.js's ResizeObserver. */
+    padding: 0;
+    height: 268px;
+    min-height: 268px;
+    position: relative;
+  }
   .chart-box.tall { height: 340px; min-height: 340px; }
+  .chart-canvas-wrap {
+    position: absolute;
+    inset: 12px 16px 16px;
+  }
+  .chart-canvas-wrap > canvas { display: block; }
 
   /* Provider health grid */
   .health {
@@ -830,6 +863,34 @@
     return { grid: { display: false, drawTicks: false }, border: { display: false }, ticks: { color: c.tickDim, font: { size: 11 }, padding: 6 } };
   }
 
+  /* Safety net for the tab-swap race: even though the canvas's parent now has
+     a definite size before construction (see .chart-canvas-wrap), some
+     browsers don't deliver the ResizeObserver tick that Chart.js relies on
+     for its first paint when the element is inserted via innerHTML in the
+     same task as construction. We attach our own observer that issues a
+     `chart.resize()` (which forces a synchronous re-measure + redraw) the
+     first time the wrapper reports a non-zero size, then disconnects.
+     This is what was actually missing — the prior fix's single rAF couldn't
+     guarantee the ResizeObserver fired before the user's eyes did. */
+  function attachFirstSizeKick(chart, wrapEl) {
+    if (!chart || !wrapEl || typeof ResizeObserver === 'undefined') return;
+    let kicked = false;
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) {
+        const cr = e.contentRect;
+        if (!kicked && cr.width > 0 && cr.height > 0) {
+          kicked = true;
+          try { chart.resize(); chart.update('none'); } catch (_) {}
+          // keep observing for sidebar collapses / window resizes — Chart.js
+          // does its own observation, but ours is a free belt-and-suspenders
+        }
+      }
+    });
+    ro.observe(wrapEl);
+    // Stash for cleanup on destroy
+    chart.$ro = ro;
+  }
+
   // Analogous palette for per-model bars (teal → cyan → blue → soft violet)
   const MODEL_PALETTE = [
     'hsl(178 42% 60%)', 'hsl(190 44% 62%)', 'hsl(202 46% 64%)',
@@ -867,7 +928,11 @@
     renderTab();
   }
   function destroyCharts() {
-    for (const k in state.charts) { try { state.charts[k].destroy(); } catch (e) {} }
+    for (const k in state.charts) {
+      const ch = state.charts[k];
+      try { if (ch && ch.$ro) ch.$ro.disconnect(); } catch (e) {}
+      try { ch && ch.destroy(); } catch (e) {}
+    }
     state.charts = {};
   }
   function renderTab() {
@@ -1027,7 +1092,7 @@
                 </span>
               </div>
             </div>
-            ${noUsage ? emptyState('No usage yet', 'Token volume will appear here as requests come in.') : `<div class="chart-box"><canvas id="ch-tokens-by-day"></canvas></div>`}
+            ${noUsage ? emptyState('No usage yet', 'Token volume will appear here as requests come in.') : `<div class="chart-box"><div class="chart-canvas-wrap"><canvas id="ch-tokens-by-day"></canvas></div></div>`}
           </div>
 
           <div class="panel">
@@ -1037,7 +1102,7 @@
                 <div class="panel-sub">top 10 · last ${state.rangeDays} days</div>
               </div>
             </div>
-            ${noModels ? emptyState('No model traffic', 'Per-model breakdown will appear once data exists.') : `<div class="chart-box"><canvas id="ch-tokens-by-model"></canvas></div>`}
+            ${noModels ? emptyState('No model traffic', 'Per-model breakdown will appear once data exists.') : `<div class="chart-box"><div class="chart-canvas-wrap"><canvas id="ch-tokens-by-model"></canvas></div></div>`}
           </div>
         </div>
 
@@ -1104,19 +1169,16 @@
         loadUsageDaily().then(loadModelRollup).then(renderTab);
       });
     });
-    // Bug fix: explicitly destroy any prior instances for this tab before
-    // re-creating against the freshly-mounted canvases. Tab swap replaces
-    // the canvas DOM nodes via innerHTML, so previously-held Chart
-    // instances point at detached canvases and would render blank.
-    if (state.charts.tokensByDay) { try { state.charts.tokensByDay.destroy(); } catch (e) {} state.charts.tokensByDay = null; }
-    if (state.charts.tokensByModel) { try { state.charts.tokensByModel.destroy(); } catch (e) {} state.charts.tokensByModel = null; }
-    // Defer chart construction until after the browser has performed layout
-    // on the freshly-mounted DOM. Synchronously calling `new Chart(canvas)`
-    // right after `host.innerHTML = ...` measures the canvas before grid/flex
-    // layout completes, so the chart is built against a 0-width box and
-    // renders blank (and pointer→data-coord hit-testing later misfires too,
-    // killing tooltips). One rAF guarantees a layout pass has happened.
-    requestAnimationFrame(() => mountOverviewCharts());
+    // Charts must be constructed AFTER the freshly-mounted DOM has had a
+    // layout pass — but a single rAF only guarantees the next render frame,
+    // not that grid/flex track resolution is observable to the canvas's
+    // ResizeObserver. We use a double rAF: rAF #1 fires after style/layout
+    // for the innerHTML insertion, rAF #2 fires after the *next* frame,
+    // by which point the .grid-2 fr-tracks are resolved AND the
+    // .chart-canvas-wrap (position:absolute; inset:…) has its final pixel
+    // size that Chart.js can measure. The attachFirstSizeKick safety net
+    // covers the rare case where even the second rAF wins the race.
+    requestAnimationFrame(() => requestAnimationFrame(() => mountOverviewCharts()));
   }
   function mountOverviewCharts() {
     const c1 = document.getElementById('ch-tokens-by-day');
@@ -1159,6 +1221,7 @@
           },
         },
       });
+      attachFirstSizeKick(state.charts.tokensByDay, c1.parentElement);
     }
     if (c2 && state.modelRollup && state.modelRollup.length) {
       const c = tokenColors();
@@ -1195,6 +1258,7 @@
           },
         },
       });
+      attachFirstSizeKick(state.charts.tokensByModel, c2.parentElement);
     }
   }
 
@@ -1260,7 +1324,7 @@
             </div>
           </div>
           ${noUsage ? emptyState('No traffic yet', 'Once your gateway receives requests, you will see them here.')
-                   : `<div class="chart-box tall"><canvas id="ch-usage-line"></canvas></div>`}
+                   : `<div class="chart-box tall"><div class="chart-canvas-wrap"><canvas id="ch-usage-line"></canvas></div></div>`}
         </div>
 
         <div class="grid-cards-2">
@@ -1321,14 +1385,10 @@
         loadUsageDaily().then(loadModelRollup).then(renderTab);
       });
     });
-    // Bug fix: explicitly destroy any prior usageLine instance — its canvas
-    // was wiped by tab swap (innerHTML), so the old reference is detached
-    // and would never render against the new canvas.
-    if (state.charts.usageLine) { try { state.charts.usageLine.destroy(); } catch (e) {} state.charts.usageLine = null; }
-    // Defer to next frame — see mountOverview for full rationale. The
-    // panel containing #ch-usage-line is in a fresh DOM subtree that has
-    // not yet been laid out when this runs synchronously after innerHTML.
-    requestAnimationFrame(() => mountUsageChart());
+    // Double rAF + ResizeObserver safety net — see mountOverview for the
+    // full rationale. A single rAF doesn't reliably guarantee that grid
+    // track widths have resolved when the canvas is constructed.
+    requestAnimationFrame(() => requestAnimationFrame(() => mountUsageChart()));
   }
   function mountUsageChart() {
     const canvas = document.getElementById('ch-usage-line');
@@ -1379,6 +1439,7 @@
         },
       },
     });
+    attachFirstSizeKick(state.charts.usageLine, canvas.parentElement);
   }
 
   /* ====================================================================
