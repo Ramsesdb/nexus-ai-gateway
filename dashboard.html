@@ -851,19 +851,26 @@
    * ==================================================================== */
   function readCss(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
   function tokenColors() {
+    // Every value MUST be a non-empty, Chart.js-parseable color string.
+    // An empty string here ends up in Chart.defaults.* (borderColor, color,
+    // tooltip.borderColor, grid.color, ticks.color) and Chart.js v4's color
+    // interpolator then has nothing to work with — during animations this
+    // can surface as "_fn is not a function" because the interpolator lookup
+    // (`Ds[type||typeof o]`) falls through on null/invalid color objects.
+    const fb = (v, d) => (v && v.length ? v : d);
     return {
-      grid:    readCss('--grid-line') || 'rgba(255,255,255,0.04)',
-      tickDim: readCss('--text-muted'),
-      tickBody:readCss('--text-dim'),
-      accent:  readCss('--accent') || '#6BB4B0',
-      accentSoft: readCss('--accent-soft'),
-      surface: readCss('--surface'),
-      surface2:readCss('--surface-2'),
-      border:  readCss('--border-strong'),
-      text:    readCss('--text'),
-      success: readCss('--success'),
-      warn:    readCss('--warn'),
-      error:   readCss('--error'),
+      grid:    fb(readCss('--grid-line'),    'rgba(255,255,255,0.04)'),
+      tickDim: fb(readCss('--text-muted'),   'rgba(255,255,255,0.45)'),
+      tickBody:fb(readCss('--text-dim'),     'rgba(255,255,255,0.65)'),
+      accent:  fb(readCss('--accent'),       '#6BB4B0'),
+      accentSoft: fb(readCss('--accent-soft'),'rgba(107,180,176,0.32)'),
+      surface: fb(readCss('--surface'),      '#0f1115'),
+      surface2:fb(readCss('--surface-2'),    '#13161c'),
+      border:  fb(readCss('--border-strong'),'rgba(255,255,255,0.10)'),
+      text:    fb(readCss('--text'),         '#e6e8ee'),
+      success: fb(readCss('--success'),      '#6BB4B0'),
+      warn:    fb(readCss('--warn'),         '#d9a24a'),
+      error:   fb(readCss('--error'),        '#d96a6a'),
     };
   }
   function applyChartDefaults() {
@@ -908,7 +915,14 @@
     C.defaults.elements.point.hoverRadius = 3;
     C.defaults.maintainAspectRatio = false;
     C.defaults.responsive = true;
-    C.defaults.animation = { duration: 240, easing: 'easeOutQuart' };
+    // Animation globally disabled — see per-chart animation:false comments.
+    // Chart.js v4 core.animations.js crashes with "_fn is not a function"
+    // when Ds[type||typeof o] returns undefined (objects/gradients/null),
+    // and our scriptable gradients + time-scale parsed values were tripping
+    // that interpolator lookup on every re-paint. No animation = no crash.
+    C.defaults.animation = false;
+    C.defaults.animations = false;
+    C.defaults.transitions = { active: { animation: { duration: 0 } }, resize: { animation: { duration: 0 } }, show: { animation: { duration: 0 } }, hide: { animation: { duration: 0 } } };
   }
   function gridScale(c) {
     return { grid: { color: c.grid, drawTicks: false, lineWidth: 1 }, border: { display: false }, ticks: { color: c.tickDim, font: { size: 11 }, padding: 8 } };
@@ -1250,6 +1264,13 @@
           ],
         },
         options: {
+          // animation:false short-circuits Chart.js v4's core.animations path
+          // that was crashing with "this._fn is not a function" (index.umd.ts:50).
+          // The interpolator lookup Ds[t.type || typeof o] returns undefined
+          // for non-number/boolean/string/color types, and with our mix of
+          // time-axis parsed values + scriptable colors we were hitting that
+          // path on re-paints. No animation = no interpolator = no crash.
+          animation: false,
           interaction: { mode: 'index', intersect: false },
           scales: {
             x: Object.assign(noGridScale(c), {
@@ -1292,6 +1313,8 @@
           }],
         },
         options: {
+          // See animation:false rationale in tokensByDay above.
+          animation: false,
           indexAxis: 'y',
           // Horizontal bar: 'index' with axis:'y' so hovering anywhere along
           // a row triggers the tooltip (Chart.js v4 doesn't accept mode:'y').
@@ -1482,6 +1505,14 @@
         }],
       },
       options: {
+        // animation:false is the definitive fix for "this._fn is not a
+        // function" thrown from chart.js core.animations (index.umd.ts:50).
+        // The scriptable backgroundColor below returns a CanvasGradient
+        // (an object) on normal paints; Chart.js v4 then tries to interpolate
+        // between the previous gradient and the new one during animation,
+        // Ds['object'] is undefined, _fn becomes undefined, crash. Skipping
+        // the animation engine entirely avoids the interpolator lookup.
+        animation: false,
         interaction: { mode: 'index', intersect: false },
         scales: {
           x: Object.assign(noGridScale(c), {
