@@ -787,19 +787,27 @@
     C.defaults.color = c.tickBody;
     C.defaults.borderColor = c.grid;
     C.defaults.plugins.legend.display = false;
+    // Tooltip: re-enabled and restyled. Defaults can be silently neutralized
+    // by stale Chart.defaults state, so set every relevant key explicitly.
     C.defaults.plugins.tooltip.enabled = true;
-    C.defaults.plugins.tooltip.backgroundColor = c.surface;
+    C.defaults.plugins.tooltip.backgroundColor = c.surface2 || c.surface;
     C.defaults.plugins.tooltip.borderColor = c.border;
     C.defaults.plugins.tooltip.borderWidth = 1;
     C.defaults.plugins.tooltip.titleColor = c.text;
-    C.defaults.plugins.tooltip.bodyColor = c.tickBody;
-    C.defaults.plugins.tooltip.padding = 10;
+    C.defaults.plugins.tooltip.bodyColor = c.text;
+    C.defaults.plugins.tooltip.padding = { top: 8, right: 10, bottom: 8, left: 10 };
     C.defaults.plugins.tooltip.cornerRadius = 6;
     C.defaults.plugins.tooltip.displayColors = true;
     C.defaults.plugins.tooltip.boxPadding = 6;
     C.defaults.plugins.tooltip.titleFont = { family: "'JetBrains Mono', monospace", size: 11, weight: '500' };
-    C.defaults.plugins.tooltip.bodyFont = { size: 12 };
+    C.defaults.plugins.tooltip.bodyFont = { family: "'JetBrains Mono', monospace", size: 12 };
     C.defaults.plugins.tooltip.caretSize = 0;
+    // Make hover responsive across the column (bars are thin) so tooltips
+    // actually surface on hover instead of requiring a pixel-perfect hit.
+    C.defaults.interaction = { mode: 'index', intersect: false };
+    C.defaults.plugins.tooltip.mode = 'index';
+    C.defaults.plugins.tooltip.intersect = false;
+    C.defaults.events = ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove'];
     C.defaults.elements.bar.borderRadius = 3;
     C.defaults.elements.bar.borderSkipped = false;
     C.defaults.elements.line.borderWidth = 1.5;
@@ -1091,6 +1099,12 @@
         loadUsageDaily().then(loadModelRollup).then(renderTab);
       });
     });
+    // Bug fix: explicitly destroy any prior instances for this tab before
+    // re-creating against the freshly-mounted canvases. Tab swap replaces
+    // the canvas DOM nodes via innerHTML, so previously-held Chart
+    // instances point at detached canvases and would render blank.
+    if (state.charts.tokensByDay) { try { state.charts.tokensByDay.destroy(); } catch (e) {} state.charts.tokensByDay = null; }
+    if (state.charts.tokensByModel) { try { state.charts.tokensByModel.destroy(); } catch (e) {} state.charts.tokensByModel = null; }
     const c1 = document.getElementById('ch-tokens-by-day');
     const c2 = document.getElementById('ch-tokens-by-model');
     if (c1 && state.usageDaily && state.usageDaily.length) {
@@ -1106,6 +1120,7 @@
           ],
         },
         options: {
+          interaction: { mode: 'index', intersect: false },
           scales: {
             x: Object.assign(noGridScale(c), {
               type: 'time',
@@ -1116,6 +1131,9 @@
           },
           plugins: {
             tooltip: {
+              enabled: true,
+              mode: 'index',
+              intersect: false,
               callbacks: {
                 title: items => {
                   const d = new Date(items[0].parsed.x);
@@ -1144,12 +1162,21 @@
         },
         options: {
           indexAxis: 'y',
+          // Horizontal bar: use 'y' index so hover anywhere in the row works.
+          interaction: { mode: 'y', intersect: false },
           layout: { padding: { right: 12 } },
           scales: {
             x: Object.assign(gridScale(c), { ticks: { ...gridScale(c).ticks, callback: v => fmtCompact(v) } }),
             y: Object.assign(noGridScale(c), { ticks: { color: c.tickBody, font: { size: 11, family: "'JetBrains Mono', monospace" } } }),
           },
-          plugins: { tooltip: { callbacks: { label: ctx => fmtInt(ctx.parsed.x) + ' tokens' } } },
+          plugins: {
+            tooltip: {
+              enabled: true,
+              mode: 'y',
+              intersect: false,
+              callbacks: { label: ctx => fmtInt(ctx.parsed.x) + ' tokens' },
+            },
+          },
         },
       });
     }
@@ -1278,6 +1305,10 @@
         loadUsageDaily().then(loadModelRollup).then(renderTab);
       });
     });
+    // Bug fix: explicitly destroy any prior usageLine instance — its canvas
+    // was wiped by tab swap (innerHTML), so the old reference is detached
+    // and would never render against the new canvas.
+    if (state.charts.usageLine) { try { state.charts.usageLine.destroy(); } catch (e) {} state.charts.usageLine = null; }
     const canvas = document.getElementById('ch-usage-line');
     if (!canvas || !state.usageDaily || !state.usageDaily.length) return;
     const c = tokenColors();
@@ -1304,6 +1335,7 @@
         }],
       },
       options: {
+        interaction: { mode: 'index', intersect: false },
         scales: {
           x: Object.assign(noGridScale(c), {
             type: 'time',
@@ -1314,6 +1346,9 @@
         },
         plugins: {
           tooltip: {
+            enabled: true,
+            mode: 'index',
+            intersect: false,
             callbacks: {
               title: items => new Date(items[0].parsed.x).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
               label: ctx => usageMetric === 'tokens' ? fmtInt(ctx.parsed.y) + ' tokens' : fmtInt(ctx.parsed.y) + ' requests',
