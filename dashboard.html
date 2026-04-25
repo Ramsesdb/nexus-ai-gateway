@@ -268,10 +268,15 @@
   .grid-cards-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 1024px) { .grid-cards-2 { grid-template-columns: 1fr; } }
 
-  /* Charts */
-  .chart-box { padding: 12px 16px 16px; height: 268px; position: relative; }
-  .chart-box.tall { height: 340px; }
-  .chart-box canvas { width: 100% !important; height: 100% !important; }
+  /* Charts
+     IMPORTANT: do NOT set canvas width/height with !important here. Chart.js
+     manages the canvas size itself when `responsive: true` + `maintainAspectRatio: false`,
+     and forcing 100%/!important breaks its internal device-pixel-ratio
+     scaling — which in turn breaks pointer→data-coordinate conversion (so
+     tooltips never fire). The chart-box height below provides the layout
+     box Chart.js measures. */
+  .chart-box { padding: 12px 16px 16px; height: 268px; min-height: 268px; position: relative; }
+  .chart-box.tall { height: 340px; min-height: 340px; }
 
   /* Provider health grid */
   .health {
@@ -1105,6 +1110,15 @@
     // instances point at detached canvases and would render blank.
     if (state.charts.tokensByDay) { try { state.charts.tokensByDay.destroy(); } catch (e) {} state.charts.tokensByDay = null; }
     if (state.charts.tokensByModel) { try { state.charts.tokensByModel.destroy(); } catch (e) {} state.charts.tokensByModel = null; }
+    // Defer chart construction until after the browser has performed layout
+    // on the freshly-mounted DOM. Synchronously calling `new Chart(canvas)`
+    // right after `host.innerHTML = ...` measures the canvas before grid/flex
+    // layout completes, so the chart is built against a 0-width box and
+    // renders blank (and pointer→data-coord hit-testing later misfires too,
+    // killing tooltips). One rAF guarantees a layout pass has happened.
+    requestAnimationFrame(() => mountOverviewCharts());
+  }
+  function mountOverviewCharts() {
     const c1 = document.getElementById('ch-tokens-by-day');
     const c2 = document.getElementById('ch-tokens-by-model');
     if (c1 && state.usageDaily && state.usageDaily.length) {
@@ -1162,8 +1176,9 @@
         },
         options: {
           indexAxis: 'y',
-          // Horizontal bar: use 'y' index so hover anywhere in the row works.
-          interaction: { mode: 'y', intersect: false },
+          // Horizontal bar: 'index' with axis:'y' so hovering anywhere along
+          // a row triggers the tooltip (Chart.js v4 doesn't accept mode:'y').
+          interaction: { mode: 'index', axis: 'y', intersect: false },
           layout: { padding: { right: 12 } },
           scales: {
             x: Object.assign(gridScale(c), { ticks: { ...gridScale(c).ticks, callback: v => fmtCompact(v) } }),
@@ -1172,7 +1187,8 @@
           plugins: {
             tooltip: {
               enabled: true,
-              mode: 'y',
+              mode: 'index',
+              axis: 'y',
               intersect: false,
               callbacks: { label: ctx => fmtInt(ctx.parsed.x) + ' tokens' },
             },
@@ -1309,6 +1325,12 @@
     // was wiped by tab swap (innerHTML), so the old reference is detached
     // and would never render against the new canvas.
     if (state.charts.usageLine) { try { state.charts.usageLine.destroy(); } catch (e) {} state.charts.usageLine = null; }
+    // Defer to next frame — see mountOverview for full rationale. The
+    // panel containing #ch-usage-line is in a fresh DOM subtree that has
+    // not yet been laid out when this runs synchronously after innerHTML.
+    requestAnimationFrame(() => mountUsageChart());
+  }
+  function mountUsageChart() {
     const canvas = document.getElementById('ch-usage-line');
     if (!canvas || !state.usageDaily || !state.usageDaily.length) return;
     const c = tokenColors();
