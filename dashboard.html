@@ -698,12 +698,27 @@
   /* ---------- Auth header ---------- */
   const AUTH_KEY = (typeof localStorage !== 'undefined' && localStorage.getItem('nexus_master_key')) || '';
 
-  /* ---------- API helper ---------- */
+  /* ---------- API helper ----------
+     Dashboard endpoints are public on this server (see index.ts auth gate
+     which explicitly skips paths starting with `/dashboard`). However,
+     when this HTML is served from a DIFFERENT origin than the gateway
+     (e.g. file://, a static host, or behind a reverse proxy that itself
+     enforces auth), relative `/dashboard/*` URLs hit that other origin
+     instead and may return 401. We log the absolute URL + status on
+     failure so the user can see exactly which origin is rejecting. */
   function api(path, opts = {}) {
     const headers = { 'Content-Type': 'application/json' };
     if (AUTH_KEY) headers['Authorization'] = `Bearer ${AUTH_KEY}`;
-    return fetch(path, { headers, ...opts }).then(r => {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+    return fetch(path, { credentials: 'same-origin', headers, ...opts }).then(r => {
+      if (!r.ok) {
+        const absUrl = (() => { try { return new URL(path, location.href).href; } catch (_) { return path; } })();
+        const err = new Error('HTTP ' + r.status + ' ' + absUrl);
+        err.status = r.status; err.url = absUrl;
+        if (r.status === 401) {
+          console.warn('[dashboard] 401 on', absUrl, '— set localStorage.nexus_master_key if the gateway requires auth, or open the dashboard via the gateway origin (e.g. http://localhost:3000/dashboard).');
+        }
+        throw err;
+      }
       return r.json();
     });
   }
@@ -741,22 +756,33 @@
     if (n >= 1000) return (n / 1000).toFixed(2) + 's';
     return Math.round(n) + 'ms';
   }
-  function fmtRel(date) {
-    let d;
-    if (date instanceof Date) {
-      d = date;
-    } else if (typeof date === 'number') {
-      // Heuristic: if it looks like seconds (10-digit), promote to ms.
-      d = new Date(date < 1e12 ? date * 1000 : date);
-    } else if (typeof date === 'string') {
-      // Server often returns "YYYY-MM-DD HH:MM:SS" or ISO without zone -> assume UTC.
-      const s = date.trim();
-      const naive = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s);
-      d = new Date(naive ? s.replace(' ', 'T') + 'Z' : s);
-    } else {
-      d = new Date(date);
+  /* Shared timestamp parser. The gateway returns naive UTC strings like
+     "2026-04-25 02:31:56" — JavaScript's `new Date(str)` interprets those
+     as LOCAL time (verified live: server "02:31:56" UTC vs client UTC-4
+     produced rows shown as "in 4h"). We append `Z` ourselves so the
+     value is anchored to UTC. ISO strings with explicit zone (`Z` or
+     `+HH:MM`) are passed through untouched — never double-stamp. */
+  function parseTs(date) {
+    if (date == null) return null;
+    if (date instanceof Date) return isNaN(date.getTime()) ? null : date;
+    if (typeof date === 'number') {
+      const d = new Date(date < 1e12 ? date * 1000 : date);
+      return isNaN(d.getTime()) ? null : d;
     }
-    if (!d || isNaN(d.getTime())) return '—';
+    if (typeof date === 'string') {
+      const s = date.trim();
+      if (!s) return null;
+      const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(s);
+      const naive = !hasZone && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s);
+      const d = new Date(naive ? s.replace(' ', 'T') + 'Z' : s);
+      return isNaN(d.getTime()) ? null : d;
+    }
+    const d = new Date(date);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  function fmtRel(date) {
+    const d = parseTs(date);
+    if (!d) return '—';
     let diff = (Date.now() - d.getTime()) / 1000;
     // Tolerate small clock skew where server time is slightly ahead of client.
     if (diff < 0 && diff > -60) diff = 0;
@@ -866,7 +892,11 @@
     C.defaults.plugins.tooltip.caretSize = 0;
     // Make hover responsive across the column (bars are thin) so tooltips
     // actually surface on hover instead of requiring a pixel-perfect hit.
-    C.defaults.interaction = { mode: 'index', intersect: false };
+    // NOTE: merge into the existing interaction object instead of replacing
+    // it — Chart.js v4 reads `axis` from defaults during scale construction
+    // and a wholesale replace can shadow internal sub-keys on subsequent
+    // re-applies (e.g. theme toggles).
+    C.defaults.interaction = Object.assign({}, C.defaults.interaction, { mode: 'index', intersect: false });
     C.defaults.plugins.tooltip.mode = 'index';
     C.defaults.plugins.tooltip.intersect = false;
     C.defaults.events = ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove'];
@@ -1428,10 +1458,21 @@
             ? data.map(d => (Number(d.tokens_input) || 0) + (Number(d.tokens_output) || 0))
             : data.map(d => Number(d.requests) || 0),
           borderColor: c.accent,
+          /* IMPORTANT: never return null/undefined here. Chart.js v4's
+             core.animations.js does `this._fn = t.fn || Ds[t.type || typeof o]`
+             and only has interpolators for number/boolean/string/color.
+             Returning null on the first paint (when chartArea is undefined)
+             leaves _fn === undefined, and the next animation step throws
+             `this._fn is not a function` at index.umd.ts:50 — which is
+             exactly the crash the user reported. Always return a valid
+             color string; upgrade to a CanvasGradient on subsequent paints. */
           backgroundColor: (ctx) => {
-            const { chart } = ctx;
+            const chart = ctx && ctx.chart;
+            if (!chart) return 'rgba(107,180,176,0.18)';
             const { ctx: g, chartArea } = chart;
-            if (!chartArea) return null;
+            if (!g || !chartArea || chartArea.bottom === chartArea.top) {
+              return 'rgba(107,180,176,0.18)';
+            }
             const grad = g.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
             grad.addColorStop(0, 'rgba(107,180,176,0.18)');
             grad.addColorStop(1, 'rgba(107,180,176,0)');
@@ -1882,10 +1923,16 @@
     const respPreview = c.response_preview || '';
     const errMsg = !c.success ? (c.error_message || 'Error') : '';
     const errCode = !c.success ? (c.error_code || '') : '';
-    const ts = c.timestamp ? new Date(c.timestamp) : null;
+    // IMPORTANT: do NOT pre-parse with `new Date(c.timestamp)` here.
+    // Server returns naive UTC strings like "2026-04-25 02:31:56" which
+    // `new Date()` interprets as LOCAL time, shifting them by the user's
+    // timezone offset (Caracas UTC-4 -> rows showed "in 4h"). Pass the
+    // raw value to fmtRel(), whose string branch correctly appends `Z`
+    // before parsing. parseTs() centralises the same logic for the title.
+    const ts = parseTs(c.timestamp);
     return `
       <tr class="clickable" data-call-row data-idx="${i}">
-        <td class="mono dim" title="${ts ? ts.toISOString() : ''}">${ts ? fmtRel(ts) : '—'}</td>
+        <td class="mono dim" title="${ts ? ts.toISOString() : ''}">${c.timestamp ? fmtRel(c.timestamp) : '—'}</td>
         <td class="mono">${escHtml(c.model || '—')}</td>
         <td class="dim"><span style="display:inline-flex;align-items:center;gap:6px"><span class="provider-dot" style="background:${provColor(c.provider)}"></span>${escHtml(provLabel(c.provider))}</span></td>
         <td class="right num-cell">${fmtMs(c.duration_ms)}</td>
@@ -2043,8 +2090,17 @@
     try {
       const data = await api(`/dashboard/calls?limit=50&offset=${state.callsOffset}`);
       const arr = Array.isArray(data) ? data : [];
-      if (append) state.calls = (state.calls || []).concat(arr);
-      else state.calls = arr;
+      const merged = append ? (state.calls || []).concat(arr) : arr;
+      // Defensive: ensure most-recent-first regardless of server order.
+      // Falls back to id when timestamps are equal/missing. Pagination
+      // (Load 50 more) keeps working because we re-sort the merged list.
+      merged.sort((a, b) => {
+        const ta = parseTs(a && a.timestamp); const tb = parseTs(b && b.timestamp);
+        const va = ta ? ta.getTime() : 0; const vb = tb ? tb.getTime() : 0;
+        if (vb !== va) return vb - va;
+        return (Number(b && b.id) || 0) - (Number(a && a.id) || 0);
+      });
+      state.calls = merged;
     } catch (e) { console.error('loadCalls:', e); if (!append) state.calls = []; }
   }
   async function loadModels() {
