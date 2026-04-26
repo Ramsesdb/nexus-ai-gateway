@@ -43,14 +43,46 @@ export class GeminiService extends BaseOpenAIService {
     const hasTools = Array.isArray(options.tools) && (options.tools as unknown[]).length > 0;
 
     if (!hasTools) {
-      yield* super.chat(messages, options);
+      // Guard against silent empty streams: Gemini's OpenAI-compat layer
+      // sometimes opens a stream and closes it without emitting any chunk.
+      // If we yield zero chunks the caller sees an empty response. Throw so
+      // the gateway's retry-loop can pick another provider.
+      let yieldedAnything = false;
+      for await (const chunk of super.chat(messages, options)) {
+        yieldedAnything = true;
+        yield chunk;
+      }
+      if (!yieldedAnything) {
+        console.warn(
+          `[${this.name}] streaming completion yielded zero chunks (likely empty Gemini response)`
+        );
+        throw new Error(
+          `Gemini streaming yielded no chunks (model ${options.model ?? 'default'}). Triggering provider retry.`
+        );
+      }
       return;
     }
 
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const completion = (await this.createChatCompletion(messages, options)) as any;
-      const choice = completion?.choices?.[0];
+
+      // Detectar empty response (Gemini sometimes returns choices:[] silently
+      // when tools format is incompatible or model doesn't support tool calling).
+      // Throwing here lets the gateway's retry-loop pick another provider.
+      const choices = completion?.choices;
+      if (!Array.isArray(choices) || choices.length === 0) {
+        console.warn(
+          `[${this.name}] empty completion received`,
+          JSON.stringify(completion).slice(0, 500)
+        );
+        throw new Error(
+          `Gemini returned empty choices array (likely tools incompatibility ` +
+          `with model ${options.model ?? 'default'}). Triggering provider retry.`
+        );
+      }
+
+      const choice = choices[0];
       const content: string | undefined = choice?.message?.content;
       if (content) {
         yield content;
