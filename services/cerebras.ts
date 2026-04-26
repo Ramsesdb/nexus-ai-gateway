@@ -6,7 +6,7 @@
 
 import OpenAI from 'openai';
 import { BaseOpenAIService } from './base';
-import type { ChatMessage, ChatOptions } from '../types';
+import type { ChatMessage, ChatOptions, ChatStreamChunk } from '../types';
 
 export class CerebrasService extends BaseOpenAIService {
   constructor(apiKey: string, instanceId: string = '1') {
@@ -111,7 +111,7 @@ export class CerebrasService extends BaseOpenAIService {
   override async *chat(
     messages: ChatMessage[],
     options: ChatOptions = {}
-  ): AsyncGenerator<string, void, unknown> {
+  ): AsyncGenerator<ChatStreamChunk, void, unknown> {
     yield* super.chat(messages, this.sanitizeOptions(options));
   }
 

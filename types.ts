@@ -59,6 +59,25 @@ export interface ChatMessage {
 // --- SERVICE INTERFACE ---
 
 /**
+ * Streaming yield event for an upstream tool_call delta.
+ * Emitted by services when the provider streams `delta.tool_calls[i]` chunks.
+ *
+ * Mirrors the OpenAI streaming shape: each chunk may carry partial info
+ * (id/name once at the start, then incremental `arguments` string fragments)
+ * for a given `index`. The consumer is responsible for accumulating these.
+ */
+export interface ToolCallDelta {
+  type: 'tool_call_delta';
+  index: number;
+  id?: string;
+  name?: string;
+  arguments?: string;
+}
+
+/** Union of values yielded by `AIService.chat()`. */
+export type ChatStreamChunk = string | ToolCallDelta;
+
+/**
  * Standard interface that all AI providers must implement.
  * This ensures the Load Balancer can treat all providers the same.
  */
@@ -69,12 +88,13 @@ export interface AIService {
   /** Provider identifier for routing logic */
   readonly provider: ProviderType;
 
-  /** 
+  /**
    * Stream chat completion responses.
    * @param messages - Array of chat messages
-   * @yields String chunks of the response
+   * @yields Either a string fragment of `delta.content`, or a `ToolCallDelta`
+   *         describing an incremental `delta.tool_calls[i]` event.
    */
-  chat(messages: ChatMessage[], options?: ChatOptions): AsyncGenerator<string, void, unknown>;
+  chat(messages: ChatMessage[], options?: ChatOptions): AsyncGenerator<ChatStreamChunk, void, unknown>;
 
   /**
    * Non-streaming completion for tool calls or JSON responses.

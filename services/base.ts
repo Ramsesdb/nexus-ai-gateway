@@ -7,6 +7,7 @@ import OpenAI from 'openai';
 import type {
     AIService,
     ChatMessage,
+    ChatStreamChunk,
     ProviderType,
     ServiceConfig,
     ChatOptions,
@@ -59,8 +60,19 @@ export abstract class BaseOpenAIService implements AIService {
     /**
      * Stream chat completion responses.
      * Common implementation for all OpenAI-compatible APIs.
+     *
+     * Yields either:
+     *   - a string (a `delta.content` fragment), or
+     *   - a `ToolCallDelta` (one entry from `delta.tool_calls[]`).
+     *
+     * Consumers MUST be prepared for both shapes; see `ChatStreamChunk` in
+     * types.ts. Tool-call deltas are emitted verbatim per chunk (id/name
+     * typically only on the first delta for an index, with incremental
+     * `arguments` string fragments following) — accumulation is the
+     * consumer's responsibility, mirroring how an OpenAI-compatible client
+     * would handle the raw upstream stream.
      */
-    async *chat(messages: ChatMessage[], options: ChatOptions = {}): AsyncGenerator<string, void, unknown> {
+    async *chat(messages: ChatMessage[], options: ChatOptions = {}): AsyncGenerator<ChatStreamChunk, void, unknown> {
         try {
             const { model, ...restOptions } = options;
             const resolvedModel = model || this.model;
@@ -81,9 +93,24 @@ export abstract class BaseOpenAIService implements AIService {
                         completion_tokens: ch.usage.completion_tokens || 0,
                     };
                 }
-                const content = ch.choices[0]?.delta?.content;
+                const delta = ch.choices?.[0]?.delta;
+                const content = delta?.content;
                 if (content) {
                     yield content;
+                }
+                const toolCalls = delta?.tool_calls;
+                if (Array.isArray(toolCalls)) {
+                    for (const tc of toolCalls) {
+                        if (!tc) continue;
+                        const idx = typeof tc.index === 'number' ? tc.index : 0;
+                        yield {
+                            type: 'tool_call_delta',
+                            index: idx,
+                            id: tc.id,
+                            name: tc.function?.name,
+                            arguments: tc.function?.arguments,
+                        };
+                    }
                 }
             }
         } catch (error) {

@@ -13,8 +13,10 @@ import { initDatabase, getDb, logUsage, refreshModelConfigCache, getCachedModelP
 import type {
   AIService,
   ChatMessage,
+  ChatStreamChunk,
   ProviderType,
   ServiceMetrics,
+  ToolCallDelta,
   TrackedService,
 } from './types';
 
@@ -393,6 +395,67 @@ const extractRequestPreview = (messages: unknown): string => {
     }
   } catch { /* ignore */ }
   return '';
+};
+
+/**
+ * Build a preview string for the model's response so it can be saved to
+ * `usage_logs.response_preview` and shown in the dashboard.
+ *
+ * Priority:
+ *   1. If `message.content` is a non-empty string, return it (capped).
+ *   2. Else, if `message.tool_calls` is a non-empty array, render a
+ *      `[tool_calls] name1({...args1...}) | name2({...args2...})` summary
+ *      so the gateway operator can see which tool the model wanted to invoke
+ *      and with what arguments (essential for debugging tool-use flows).
+ *   3. Else, return the literal `(empty response)` so the dashboard shows
+ *      something distinguishable from `null`.
+ *
+ * Cap matches the existing 300-char limit used at the call sites.
+ */
+const extractResponsePreview = (
+  message: unknown,
+  accumulatedContent?: string,
+  accumulatedToolCalls?: Array<{ name?: string; arguments?: string }>
+): string => {
+  const CAP = 300;
+  try {
+    const m = message as any;
+    const content = typeof m?.content === 'string' ? m.content : '';
+    if (content) return content.slice(0, CAP);
+
+    if (accumulatedContent) return accumulatedContent.slice(0, CAP);
+
+    const toolCalls = m?.tool_calls;
+    if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+      const parts: string[] = [];
+      for (const tc of toolCalls) {
+        const name = tc?.function?.name ?? tc?.name ?? 'unknown';
+        const rawArgs = tc?.function?.arguments;
+        const args = typeof rawArgs === 'string'
+          ? rawArgs
+          : (rawArgs !== undefined ? JSON.stringify(rawArgs) : '');
+        parts.push(`${name}(${args})`);
+      }
+      return `[tool_calls] ${parts.join(' | ')}`.slice(0, CAP);
+    }
+
+    // Stream-path fallback: tool_calls were accumulated from delta chunks.
+    if (Array.isArray(accumulatedToolCalls) && accumulatedToolCalls.length > 0) {
+      const parts = accumulatedToolCalls.map(tc =>
+        `${tc.name ?? 'unknown'}(${tc.arguments ?? ''})`
+      );
+      return `[tool_calls] ${parts.join(' | ')}`.slice(0, CAP);
+    }
+  } catch { /* ignore */ }
+
+  if (accumulatedContent) return accumulatedContent.slice(0, CAP);
+  if (Array.isArray(accumulatedToolCalls) && accumulatedToolCalls.length > 0) {
+    const parts = accumulatedToolCalls.map(tc =>
+      `${tc.name ?? 'unknown'}(${tc.arguments ?? ''})`
+    );
+    return `[tool_calls] ${parts.join(' | ')}`.slice(0, CAP);
+  }
+  return '(empty response)';
 };
 
 // --- 7. HEALTH-AWARE LOAD BALANCER ---
@@ -1263,9 +1326,9 @@ const server = Bun.serve({
 
               const usage = (completion as any)?.usage;
               const originIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
-              const responsePreview = typeof (completion as any)?.choices?.[0]?.message?.content === 'string'
-                ? (completion as any).choices[0].message.content.slice(0, 300)
-                : undefined;
+              const responsePreview = extractResponsePreview(
+                (completion as any)?.choices?.[0]?.message
+              );
               logUsage({
                 model: serviceOptions.model || service.name,
                 provider: service.provider,
@@ -1341,6 +1404,22 @@ const server = Bun.serve({
           async start(controller) {
             let controllerClosed = false;
             let responseContent = '';
+            // Accumulator for streamed tool_call deltas, indexed by `delta.index`.
+            // Mirrors the typical OpenAI streaming pattern (id/name arrive once,
+            // then `arguments` arrives as a sequence of string fragments to
+            // concatenate). Used solely for `response_preview` telemetry — the
+            // client-facing SSE stream is unchanged.
+            const toolCallAcc: Map<number, { id?: string; name?: string; arguments: string }> = new Map();
+            // Tracks the most recent provider that successfully emitted a
+            // chunk to the client. Used so the final `finish_reason` chunk
+            // we synthesize after the stream ends carries the right model
+            // string.
+            let lastEmittedServiceName: string | null = null;
+            const flattenedToolCalls = (): Array<{ name?: string; arguments?: string }> => {
+              return Array.from(toolCallAcc.entries())
+                .sort((a, b) => a[0] - b[0])
+                .map(([, v]) => ({ name: v.name, arguments: v.arguments }));
+            };
             const safeEnqueue = (chunk: Uint8Array) => {
               if (controllerClosed) return;
               try {
@@ -1364,7 +1443,50 @@ const server = Bun.serve({
               let started = false;
               let attemptNumber = 0;
 
-              const emitChunk = (service: AIService, content: string) => {
+              const emitChunk = (service: AIService, chunk: ChatStreamChunk) => {
+                if (typeof chunk !== 'string') {
+                  if (chunk?.type === 'tool_call_delta') {
+                    // Telemetry accumulator (used for response_preview).
+                    const idx = chunk.index;
+                    const existing = toolCallAcc.get(idx) ?? { arguments: '' };
+                    if (chunk.id !== undefined) existing.id = chunk.id;
+                    if (chunk.name !== undefined) existing.name = chunk.name;
+                    if (chunk.arguments) existing.arguments += chunk.arguments;
+                    toolCallAcc.set(idx, existing);
+
+                    // Forward the delta to the client as a standard OpenAI
+                    // streaming `tool_calls` chunk. The first delta for a
+                    // given index typically carries `id` + `name`; subsequent
+                    // deltas carry `arguments` fragments that the client
+                    // concatenates. Only include fields that are actually
+                    // present in this delta — never emit undefined.
+                    const hasFunctionFields = chunk.name !== undefined || chunk.arguments !== undefined;
+                    const toolCallDelta: Record<string, unknown> = { index: chunk.index };
+                    if (chunk.id !== undefined) toolCallDelta.id = chunk.id;
+                    if (hasFunctionFields) {
+                      toolCallDelta.type = 'function';
+                      const fn: Record<string, unknown> = {};
+                      if (chunk.name !== undefined) fn.name = chunk.name;
+                      if (chunk.arguments !== undefined) fn.arguments = chunk.arguments;
+                      toolCallDelta.function = fn;
+                    }
+                    const data = {
+                      id: requestId,
+                      object: 'chat.completion.chunk',
+                      created,
+                      model: service.name,
+                      choices: [{
+                        delta: { tool_calls: [toolCallDelta] },
+                        index: 0,
+                        finish_reason: null,
+                      }],
+                    };
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+                    lastEmittedServiceName = service.name;
+                  }
+                  return;
+                }
+                const content = chunk;
                 responseContent += content;
                 const data = {
                   id: requestId,
@@ -1374,6 +1496,7 @@ const server = Bun.serve({
                   choices: [{ delta: { content }, index: 0, finish_reason: null }],
                 };
                 safeEnqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+                lastEmittedServiceName = service.name;
               };
 
               const emitError = (message: string) => {
@@ -1528,7 +1651,7 @@ const server = Bun.serve({
                       referer,
                       userAgent,
                       requestPreview,
-                      responsePreview: responseContent.slice(0, 300) || undefined,
+                      responsePreview: extractResponsePreview(undefined, responseContent, flattenedToolCalls()),
                     });
                     // Emit metadata for non-streaming response too
                     emitMetadata(
@@ -1574,7 +1697,7 @@ const server = Bun.serve({
                       referer,
                       userAgent,
                       requestPreview,
-                      responsePreview: responseContent.slice(0, 300) || undefined,
+                      responsePreview: extractResponsePreview(undefined, responseContent, flattenedToolCalls()),
                     });
                     break;
                   }
@@ -1615,7 +1738,10 @@ const server = Bun.serve({
                     referer,
                     userAgent,
                     requestPreview,
-                    responsePreview: responseContent.slice(0, 300) || undefined,
+                    responsePreview: (() => {
+                      const preview = extractResponsePreview(undefined, responseContent, flattenedToolCalls());
+                      return preview === '(empty response)' ? undefined : preview;
+                    })(),
                   });
 
                   if (started) break;
@@ -1628,6 +1754,24 @@ const server = Bun.serve({
                   : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`;
                 console.warn('[GatewayReturningError]', 'stream', streamErrMsg);
                 emitError(streamErrMsg);
+              }
+
+              // If the upstream stream finished with tool_calls, synthesize
+              // a final chunk carrying `finish_reason: 'tool_calls'` so the
+              // client (e.g. Wallex's _ToolCallAccumulator) knows the
+              // tool-calling phase is complete. Provider deltas in this
+              // gateway always carry `finish_reason: null`, so without this
+              // chunk the client never sees the terminal signal before
+              // `[DONE]`.
+              if (started && !aborted && toolCallAcc.size > 0) {
+                const finalData = {
+                  id: requestId,
+                  object: 'chat.completion.chunk',
+                  created,
+                  model: lastEmittedServiceName ?? body.model ?? 'unknown',
+                  choices: [{ delta: {}, index: 0, finish_reason: 'tool_calls' }],
+                };
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify(finalData)}\n\n`));
               }
 
               safeEnqueue(encoder.encode('data: [DONE]\n\n'));

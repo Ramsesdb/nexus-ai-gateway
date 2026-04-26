@@ -11,7 +11,7 @@
 
 import OpenAI from 'openai';
 import { BaseOpenAIService } from './base';
-import type { ChatMessage, ChatOptions } from '../types';
+import type { ChatMessage, ChatOptions, ChatStreamChunk } from '../types';
 
 export class GeminiService extends BaseOpenAIService {
   constructor(apiKey: string, instanceId: string = '1') {
@@ -39,7 +39,7 @@ export class GeminiService extends BaseOpenAIService {
   override async *chat(
     messages: ChatMessage[],
     options: ChatOptions = {}
-  ): AsyncGenerator<string, void, unknown> {
+  ): AsyncGenerator<ChatStreamChunk, void, unknown> {
     const hasTools = Array.isArray(options.tools) && (options.tools as unknown[]).length > 0;
 
     if (!hasTools) {
@@ -54,6 +54,29 @@ export class GeminiService extends BaseOpenAIService {
       const content: string | undefined = choice?.message?.content;
       if (content) {
         yield content;
+      }
+      // Re-emit tool_calls from the non-streaming response as synthetic
+      // deltas so the gateway's stream consumer can record what the model
+      // wanted to invoke (response_preview, etc.). One delta per tool_call
+      // carrying the full id/name/arguments — equivalent to a single-chunk
+      // upstream stream.
+      const toolCalls = choice?.message?.tool_calls;
+      if (Array.isArray(toolCalls)) {
+        for (let i = 0; i < toolCalls.length; i++) {
+          const tc = toolCalls[i];
+          if (!tc) continue;
+          yield {
+            type: 'tool_call_delta',
+            index: typeof tc.index === 'number' ? tc.index : i,
+            id: tc.id,
+            name: tc.function?.name,
+            arguments: typeof tc.function?.arguments === 'string'
+              ? tc.function.arguments
+              : tc.function?.arguments !== undefined
+                ? JSON.stringify(tc.function.arguments)
+                : undefined,
+          };
+        }
       }
     } catch (error) {
       console.error(`[${this.name}] Error:`, error);
