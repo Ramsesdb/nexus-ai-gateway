@@ -4,6 +4,8 @@
  */
 
 import { createClient, type Client } from '@libsql/client';
+import { randomBytes } from 'node:crypto';
+import type { GatewayToken } from '../types';
 
 let db: Client | null = null;
 
@@ -47,6 +49,8 @@ export async function initDatabase(): Promise<void> {
     try { await db.execute(`ALTER TABLE usage_logs ADD COLUMN response_preview TEXT`); } catch { /* column may already exist */ }
     try { await db.execute(`ALTER TABLE usage_logs ADD COLUMN referer TEXT`); } catch { /* column may already exist */ }
     try { await db.execute(`ALTER TABLE usage_logs ADD COLUMN user_agent TEXT`); } catch { /* column may already exist */ }
+    // Per-user token attribution: NULL means master-key (admin) request.
+    try { await db.execute(`ALTER TABLE usage_logs ADD COLUMN token_id INTEGER`); } catch { /* column may already exist */ }
 
     await db.execute(`
       CREATE TABLE IF NOT EXISTS api_keys (
@@ -70,6 +74,26 @@ export async function initDatabase(): Promise<void> {
       )
     `);
 
+    // Per-user gateway tokens. The master key remains the admin credential;
+    // these tokens are individual, label-scoped credentials with optional
+    // monthly token quotas, intended to be handed out to friends/teammates.
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS gateway_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT NOT NULL,
+        secret TEXT NOT NULL UNIQUE,
+        active INTEGER NOT NULL DEFAULT 1,
+        monthly_quota_tokens INTEGER,
+        used_tokens_current_month INTEGER NOT NULL DEFAULT 0,
+        quota_reset_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        last_used_at TEXT,
+        notes TEXT
+      )
+    `);
+    await db.execute(`CREATE INDEX IF NOT EXISTS idx_gateway_tokens_secret ON gateway_tokens(secret)`);
+    await db.execute(`CREATE INDEX IF NOT EXISTS idx_gateway_tokens_active ON gateway_tokens(active)`);
+
     console.log('[Database] Connected and tables initialized.');
   } catch (err) {
     console.error('[Database] Connection failed:', err);
@@ -91,11 +115,12 @@ export function logUsage(params: {
   userAgent?: string;
   requestPreview?: string;
   responsePreview?: string;
+  tokenId?: number | null;
 }): void {
   if (!db) return;
   db.execute({
-    sql: `INSERT INTO usage_logs (model, provider, tokens_input, tokens_output, duration_ms, success, error_message, error_code, origin_ip, referer, user_agent, request_preview, response_preview)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    sql: `INSERT INTO usage_logs (model, provider, tokens_input, tokens_output, duration_ms, success, error_message, error_code, origin_ip, referer, user_agent, request_preview, response_preview, token_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       params.model,
       params.provider,
@@ -110,6 +135,7 @@ export function logUsage(params: {
       params.userAgent || null,
       params.requestPreview || null,
       params.responsePreview || null,
+      params.tokenId ?? null,
     ],
   }).catch(err => console.error('[Database] Failed to log usage:', err));
 }
@@ -211,4 +237,248 @@ export function getCachedModelProvider(modelName: string): ProviderType | undefi
 export function maskKey(value: string): string {
   if (value.length <= 8) return value;
   return value.slice(0, 4) + '...' + value.slice(-4);
+}
+
+// =============================================================================
+// GATEWAY TOKENS (per-user credentials with optional monthly token quotas)
+// =============================================================================
+
+/**
+ * Compute the next quota reset timestamp: first day of next month at 00:00 UTC,
+ * formatted as ISO-8601 ("YYYY-MM-DDTHH:mm:ss.sssZ").
+ */
+function nextMonthlyResetIso(from: Date = new Date()): string {
+  const year = from.getUTCFullYear();
+  const month = from.getUTCMonth(); // 0-11
+  // First day of next month at 00:00:00 UTC.
+  return new Date(Date.UTC(year, month + 1, 1, 0, 0, 0, 0)).toISOString();
+}
+
+/**
+ * Map a raw row from `gateway_tokens` into the typed `GatewayToken` shape.
+ * Numeric flags come back as bigint/number from libsql; coerce them.
+ */
+function rowToGatewayToken(r: any): GatewayToken {
+  return {
+    id: Number(r.id),
+    label: String(r.label),
+    secret: String(r.secret),
+    active: Number(r.active) === 1 ? 1 : 0,
+    monthly_quota_tokens: r.monthly_quota_tokens == null ? null : Number(r.monthly_quota_tokens),
+    used_tokens_current_month: Number(r.used_tokens_current_month ?? 0),
+    quota_reset_at: r.quota_reset_at == null ? null : String(r.quota_reset_at),
+    created_at: String(r.created_at),
+    last_used_at: r.last_used_at == null ? null : String(r.last_used_at),
+    notes: r.notes == null ? null : String(r.notes),
+  };
+}
+
+/**
+ * Lookup a gateway token by its full secret value. Returns `null` if the DB
+ * is unavailable, the secret is not found, or any error occurs.
+ */
+export async function findGatewayTokenBySecret(secret: string): Promise<GatewayToken | null> {
+  if (!db) return null;
+  try {
+    const result = await db.execute({
+      sql: 'SELECT id, label, secret, active, monthly_quota_tokens, used_tokens_current_month, quota_reset_at, created_at, last_used_at, notes FROM gateway_tokens WHERE secret = ? LIMIT 1',
+      args: [secret],
+    });
+    if (result.rows.length === 0) return null;
+    return rowToGatewayToken(result.rows[0]);
+  } catch (err) {
+    console.error('[Database] findGatewayTokenBySecret failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Increment a token's monthly usage counter. If the stored `quota_reset_at`
+ * has already passed, the counter is reset to the new amount (not added) and
+ * `quota_reset_at` is rolled forward to the first of the next month.
+ */
+export async function incrementTokenUsage(tokenId: number, tokensUsed: number): Promise<void> {
+  if (!db) return;
+  if (!Number.isFinite(tokensUsed) || tokensUsed <= 0) {
+    // Still bump last_used_at on zero-token requests so dashboards show activity.
+    try {
+      await db.execute({
+        sql: `UPDATE gateway_tokens SET last_used_at = datetime('now') WHERE id = ?`,
+        args: [tokenId],
+      });
+    } catch (err) {
+      console.error('[Database] incrementTokenUsage (last_used_at only) failed:', err);
+    }
+    return;
+  }
+  try {
+    const row = await db.execute({
+      sql: 'SELECT quota_reset_at, used_tokens_current_month FROM gateway_tokens WHERE id = ? LIMIT 1',
+      args: [tokenId],
+    });
+    if (row.rows.length === 0) return;
+    const r: any = row.rows[0];
+    const resetAt: string | null = r.quota_reset_at == null ? null : String(r.quota_reset_at);
+    const now = new Date();
+    const needsReset = !resetAt || new Date(resetAt).getTime() <= now.getTime();
+
+    if (needsReset) {
+      const nextReset = nextMonthlyResetIso(now);
+      await db.execute({
+        sql: `UPDATE gateway_tokens
+              SET used_tokens_current_month = ?,
+                  quota_reset_at = ?,
+                  last_used_at = datetime('now')
+              WHERE id = ?`,
+        args: [Math.floor(tokensUsed), nextReset, tokenId],
+      });
+    } else {
+      await db.execute({
+        sql: `UPDATE gateway_tokens
+              SET used_tokens_current_month = used_tokens_current_month + ?,
+                  last_used_at = datetime('now')
+              WHERE id = ?`,
+        args: [Math.floor(tokensUsed), tokenId],
+      });
+    }
+  } catch (err) {
+    console.error('[Database] incrementTokenUsage failed:', err);
+  }
+}
+
+/**
+ * Generate a fresh secret of the form "tk_<48 hex chars>".
+ */
+function generateTokenSecret(): string {
+  return 'tk_' + randomBytes(24).toString('hex');
+}
+
+/**
+ * Create a new gateway token. Returns the freshly generated id + secret.
+ * Throws if the DB is unavailable.
+ */
+export async function createGatewayToken(
+  label: string,
+  monthlyQuotaTokens?: number | null,
+  notes?: string | null,
+): Promise<{ id: number; secret: string; quotaResetAt: string }> {
+  if (!db) throw new Error('Database unavailable');
+  const trimmedLabel = label.trim();
+  if (!trimmedLabel) throw new Error('label is required');
+
+  const secret = generateTokenSecret();
+  const quotaResetAt = nextMonthlyResetIso();
+  const quota = monthlyQuotaTokens == null ? null : Math.max(0, Math.floor(monthlyQuotaTokens));
+
+  const result = await db.execute({
+    sql: `INSERT INTO gateway_tokens (label, secret, active, monthly_quota_tokens, used_tokens_current_month, quota_reset_at, notes)
+          VALUES (?, ?, 1, ?, 0, ?, ?)`,
+    args: [trimmedLabel, secret, quota, quotaResetAt, notes?.trim() || null],
+  });
+
+  const id = Number(result.lastInsertRowid ?? 0);
+  return { id, secret, quotaResetAt };
+}
+
+/**
+ * Mask a secret for display: show prefix + last 4. Returns "tk_a1b2***...***xyz9".
+ */
+export function maskTokenSecret(secret: string): string {
+  if (!secret) return '';
+  if (secret.length <= 12) return secret.slice(0, 4) + '***';
+  return secret.slice(0, 6) + '***' + secret.slice(-4);
+}
+
+/**
+ * List all gateway tokens with masked secrets.
+ */
+export async function listGatewayTokens(): Promise<Array<Omit<GatewayToken, 'secret'> & { secret_masked: string }>> {
+  if (!db) return [];
+  try {
+    const result = await db.execute(
+      'SELECT id, label, secret, active, monthly_quota_tokens, used_tokens_current_month, quota_reset_at, created_at, last_used_at, notes FROM gateway_tokens ORDER BY id DESC'
+    );
+    return result.rows.map((r: any) => {
+      const tok = rowToGatewayToken(r);
+      const { secret, ...rest } = tok;
+      return { ...rest, secret_masked: maskTokenSecret(secret) };
+    });
+  } catch (err) {
+    console.error('[Database] listGatewayTokens failed:', err);
+    return [];
+  }
+}
+
+/**
+ * Soft-revoke a token (sets active=0). Returns the row's label, or null if not found.
+ */
+export async function revokeGatewayToken(id: number): Promise<{ label: string } | null> {
+  if (!db) throw new Error('Database unavailable');
+  const before = await db.execute({
+    sql: 'SELECT label FROM gateway_tokens WHERE id = ? LIMIT 1',
+    args: [id],
+  });
+  if (before.rows.length === 0) return null;
+  await db.execute({
+    sql: 'UPDATE gateway_tokens SET active = 0 WHERE id = ?',
+    args: [id],
+  });
+  return { label: String((before.rows[0] as any).label) };
+}
+
+/**
+ * Partial update of a gateway token. Only provided fields are touched.
+ * `monthlyQuotaTokens` may be passed as `null` to explicitly clear the quota.
+ */
+export async function updateGatewayToken(
+  id: number,
+  changes: { active?: boolean; monthlyQuotaTokens?: number | null; notes?: string | null },
+): Promise<boolean> {
+  if (!db) throw new Error('Database unavailable');
+  const sets: string[] = [];
+  const args: Array<string | number | null> = [];
+
+  if (changes.active !== undefined) {
+    sets.push('active = ?');
+    args.push(changes.active ? 1 : 0);
+  }
+  if (changes.monthlyQuotaTokens !== undefined) {
+    sets.push('monthly_quota_tokens = ?');
+    args.push(changes.monthlyQuotaTokens == null ? null : Math.max(0, Math.floor(changes.monthlyQuotaTokens)));
+  }
+  if (changes.notes !== undefined) {
+    sets.push('notes = ?');
+    args.push(changes.notes == null ? null : (changes.notes.trim() || null));
+  }
+
+  if (sets.length === 0) return false;
+
+  args.push(id);
+  const result = await db.execute({
+    sql: `UPDATE gateway_tokens SET ${sets.join(', ')} WHERE id = ?`,
+    args,
+  });
+  return Number((result as any).rowsAffected ?? 0) > 0;
+}
+
+/**
+ * Reset a token's monthly counter to zero and roll `quota_reset_at` forward.
+ * Returns false when the token does not exist.
+ */
+export async function resetGatewayTokenUsage(id: number): Promise<boolean> {
+  if (!db) throw new Error('Database unavailable');
+  const exists = await db.execute({
+    sql: 'SELECT id FROM gateway_tokens WHERE id = ? LIMIT 1',
+    args: [id],
+  });
+  if (exists.rows.length === 0) return false;
+
+  await db.execute({
+    sql: `UPDATE gateway_tokens
+          SET used_tokens_current_month = 0,
+              quota_reset_at = ?
+          WHERE id = ?`,
+    args: [nextMonthlyResetIso(), id],
+  });
+  return true;
 }

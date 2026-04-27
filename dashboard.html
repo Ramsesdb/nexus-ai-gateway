@@ -607,6 +607,18 @@
     <symbol id="i-doc" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
       <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/>
     </symbol>
+    <symbol id="i-tokens" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="9" cy="9" r="6"/><circle cx="9" cy="9" r="2"/><path d="M14.5 14.5L21 21M16 19l3-3"/>
+    </symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+    </symbol>
+    <symbol id="i-rotate" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8M21 4v4h-4M21 12a9 9 0 0 1-15.5 6.3L3 16M3 20v-4h4"/>
+    </symbol>
   </defs>
 </svg>
 
@@ -626,6 +638,7 @@
       <button class="nav-item" data-tab="usage"><svg class="nav-icon"><use href="#i-usage"/></svg><span>Usage</span></button>
       <button class="nav-item" data-tab="models"><svg class="nav-icon"><use href="#i-models"/></svg><span>Models</span><span class="count" id="nav-models-count"></span></button>
       <button class="nav-item" data-tab="keys"><svg class="nav-icon"><use href="#i-keys"/></svg><span>API Keys</span><span class="count" id="nav-keys-count"></span></button>
+      <button class="nav-item" data-tab="tokens"><svg class="nav-icon"><use href="#i-tokens"/></svg><span>User Tokens</span><span class="count" id="nav-tokens-count"></span></button>
       <button class="nav-item" data-tab="log"><svg class="nav-icon"><use href="#i-log"/></svg><span>Call Log</span></button>
     </nav>
 
@@ -648,6 +661,7 @@
       <div class="topbar-right">
         <span class="live-dot" id="live-dot"><span id="live-label">live · refreshes 30s</span></span>
         <button class="icon-btn" id="btn-refresh" title="Refresh"><svg><use href="#i-refresh"/></svg></button>
+        <button class="icon-btn" id="btn-logout" title="Sign out"><svg><use href="#i-logout"/></svg></button>
       </div>
     </div>
 
@@ -709,12 +723,24 @@
   function api(path, opts = {}) {
     const headers = { 'Content-Type': 'application/json' };
     if (AUTH_KEY) headers['Authorization'] = `Bearer ${AUTH_KEY}`;
-    return fetch(path, { credentials: 'same-origin', headers, ...opts }).then(r => {
+    return fetch(path, { credentials: 'same-origin', headers, ...opts }).then(async r => {
       if (!r.ok) {
         const absUrl = (() => { try { return new URL(path, location.href).href; } catch (_) { return path; } })();
         const err = new Error('HTTP ' + r.status + ' ' + absUrl);
         err.status = r.status; err.url = absUrl;
         if (r.status === 401) {
+          // Server now returns { loginRequired: true } when the dashboard
+          // session cookie is missing or expired. Bounce to the login page so
+          // the user can re-auth instead of staring at a broken dashboard.
+          let body = null;
+          try { body = await r.clone().json(); } catch (_) {}
+          if (body && body.loginRequired) {
+            const next = encodeURIComponent(location.pathname + location.search);
+            location.href = '/dashboard/login?next=' + next;
+            // Don't resolve — the page is being replaced. Throwing keeps any
+            // in-flight UI state from overwriting things during navigation.
+            throw err;
+          }
           console.warn('[dashboard] 401 on', absUrl, '— set localStorage.nexus_master_key if the gateway requires auth, or open the dashboard via the gateway origin (e.g. http://localhost:3000/dashboard).');
         }
         throw err;
@@ -981,6 +1007,7 @@
     callsFilter: 'all',  // all | success | error
     models: null,        // [{id, model_name, provider, active, created_at}]
     apiKeys: null,       // [{id, provider, key_value (masked), account_id, label, active, created_at}]
+    tokens: null,        // [{id, label, secret_masked, active, monthly_quota_tokens, used_tokens_current_month, last_used_at, created_at, notes}]
     rangeDays: 30,
     online: true,
   };
@@ -988,7 +1015,7 @@
   /* ====================================================================
    *  Tab swap
    * ==================================================================== */
-  const TAB_LABEL = { overview: 'Overview', usage: 'Usage', models: 'Models', keys: 'API Keys', log: 'Call Log' };
+  const TAB_LABEL = { overview: 'Overview', usage: 'Usage', models: 'Models', keys: 'API Keys', tokens: 'User Tokens', log: 'Call Log' };
   function switchTab(name) {
     state.tab = name;
     document.querySelectorAll('#nav .nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === name));
@@ -1013,6 +1040,7 @@
       case 'usage':    html = renderUsage(); break;
       case 'models':   html = renderModels(); break;
       case 'keys':     html = renderKeys(); break;
+      case 'tokens':   html = renderTokens(); break;
       case 'log':      html = renderLog(); break;
     }
     host.innerHTML = html;
@@ -1020,6 +1048,7 @@
     if (state.tab === 'usage')    mountUsage();
     if (state.tab === 'models')   mountModels();
     if (state.tab === 'keys')     mountKeys();
+    if (state.tab === 'tokens')   mountTokens();
     if (state.tab === 'log')      mountLog();
   }
 
@@ -1895,6 +1924,322 @@
   }
 
   /* ====================================================================
+   *  USER TOKENS (per-user gateway tokens with monthly quotas)
+   * ==================================================================== */
+  function fmtQuota(used, quota) {
+    const u = fmtInt(Number(used) || 0);
+    if (quota == null) return `${u} / ∞`;
+    return `${u} / ${fmtInt(Number(quota) || 0)}`;
+  }
+  function quotaBarHtml(used, quota) {
+    if (quota == null || !Number(quota)) return '';
+    const pct = Math.min(100, Math.round(((Number(used) || 0) / Number(quota)) * 100));
+    return `<div class="mini-bar" title="${pct}% used"><span style="width:${pct}%"></span></div>`;
+  }
+  function renderTokens() {
+    const list = state.tokens || [];
+    const total = list.length;
+    const active = list.filter(t => t.active).length;
+    return `
+      <div class="page">
+        <div class="page-head">
+          <div>
+            <h1 class="page-title">User Tokens</h1>
+            <p class="page-sub">${total} total · ${active} active · per-user gateway credentials with optional monthly quotas</p>
+          </div>
+          <button class="btn primary" id="btn-add-token"><svg><use href="#i-plus"/></svg>Create token</button>
+        </div>
+
+        <div class="panel">
+          <div class="toolbar">
+            <div class="search">
+              <svg><use href="#i-search"/></svg>
+              <input id="token-search" placeholder="Filter by label, secret suffix, notes…" />
+            </div>
+            <div class="toolbar-spacer"></div>
+            <span class="toolbar-meta">quotas reset on the 1st of each month</span>
+          </div>
+          ${total === 0 ? emptyState('No user tokens yet', 'Create one to hand out scoped, quota-limited access to /v1/*.') : `
+          <div class="table-wrap">
+            <table class="table compact">
+              <thead><tr>
+                <th>Label</th>
+                <th>Status</th>
+                <th>This month</th>
+                <th>Last used</th>
+                <th>Secret</th>
+                <th class="dim">Created</th>
+                <th class="right" style="width:200px">Actions</th>
+              </tr></thead>
+              <tbody>
+                ${list.map(t => {
+                  const masked = t.secret_masked || t.secret || '—';
+                  return `
+                  <tr data-token-row data-tokenid="${t.id}">
+                    <td>
+                      <div style="font-weight:500">${escHtml(t.label || '—')}</div>
+                      ${t.notes ? `<div class="dim" style="font-size:11px;margin-top:2px">${escHtml(t.notes)}</div>` : ''}
+                    </td>
+                    <td>${t.active ? badge('ok', 'Active') : badge('err', 'Revoked')}</td>
+                    <td>
+                      <div class="mono num" style="font-size:12px">${fmtQuota(t.used_tokens_current_month, t.monthly_quota_tokens)}</div>
+                      ${quotaBarHtml(t.used_tokens_current_month, t.monthly_quota_tokens)}
+                    </td>
+                    <td class="dim mono">${t.last_used_at ? fmtRel(t.last_used_at) : 'never'}</td>
+                    <td class="mono dim">${escHtml(masked)}</td>
+                    <td class="dim mono">${t.created_at ? new Date(t.created_at).toLocaleDateString() : '—'}</td>
+                    <td class="right" onclick="event.stopPropagation()">
+                      <span class="row-actions">
+                        <button class="btn xs" data-edit-token="${t.id}" data-label="${escAttr(t.label || '')}" data-quota="${t.monthly_quota_tokens == null ? '' : t.monthly_quota_tokens}" data-notes="${escAttr(t.notes || '')}" data-active="${t.active ? 1 : 0}" title="Edit"><svg><use href="#i-edit"/></svg></button>
+                        <button class="btn xs" data-reset-token="${t.id}" data-label="${escAttr(t.label || '')}" title="Reset usage this month"><svg><use href="#i-rotate"/></svg></button>
+                        ${t.active ? `<button class="btn xs danger" data-revoke-token="${t.id}" data-label="${escAttr(t.label || '')}" title="Revoke"><svg><use href="#i-trash"/></svg></button>` : ''}
+                      </span>
+                    </td>
+                  </tr>
+                `;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>`}
+        </div>
+      </div>
+    `;
+  }
+  function mountTokens() {
+    const search = document.getElementById('token-search');
+    if (search) search.addEventListener('input', e => {
+      const q = e.target.value.toLowerCase();
+      document.querySelectorAll('#tab-host tbody tr').forEach(tr => {
+        tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+      });
+    });
+    const addBtn = document.getElementById('btn-add-token');
+    if (addBtn) addBtn.addEventListener('click', () => openTokenCreateModal());
+    document.querySelectorAll('[data-edit-token]').forEach(b => {
+      b.addEventListener('click', () => openTokenEditModal({
+        id: parseInt(b.dataset.editToken, 10),
+        label: b.dataset.label || '',
+        monthly_quota_tokens: b.dataset.quota === '' ? null : Number(b.dataset.quota),
+        notes: b.dataset.notes || '',
+        active: parseInt(b.dataset.active, 10) === 1,
+      }));
+    });
+    document.querySelectorAll('[data-reset-token]').forEach(b => {
+      b.addEventListener('click', () => confirmTokenAction('reset', parseInt(b.dataset.resetToken, 10), b.dataset.label));
+    });
+    document.querySelectorAll('[data-revoke-token]').forEach(b => {
+      b.addEventListener('click', () => confirmTokenAction('revoke', parseInt(b.dataset.revokeToken, 10), b.dataset.label));
+    });
+  }
+
+  function openTokenCreateModal() {
+    const html = `
+      <div class="modal-overlay" data-modal-overlay>
+        <div class="modal">
+          <div class="modal-header">
+            <h3>Create user token</h3>
+            <button class="modal-close" data-modal-close aria-label="Close">×</button>
+          </div>
+          <div class="modal-body">
+            <div class="form-group">
+              <label>Label</label>
+              <input type="text" id="tf-label" placeholder="e.g. juan, maria, wallex-prod" autofocus>
+            </div>
+            <div class="form-group">
+              <label>Monthly quota (tokens)</label>
+              <input type="text" id="tf-quota" inputmode="numeric" placeholder="Leave empty for unlimited">
+            </div>
+            <div class="form-group">
+              <label>Notes <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-muted)">(optional)</span></label>
+              <input type="text" id="tf-notes" placeholder="Internal note, owner email…">
+            </div>
+            <div class="form-actions">
+              <button class="btn" data-modal-close>Cancel</button>
+              <button class="btn primary" id="btn-save-token">Create</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById('modal-container').innerHTML = html;
+    wireModalClose();
+    document.getElementById('btn-save-token').onclick = async () => {
+      const label = document.getElementById('tf-label').value.trim();
+      const quotaRaw = document.getElementById('tf-quota').value.trim();
+      const notes = document.getElementById('tf-notes').value.trim();
+      if (!label) return toast('Label is required', 'error');
+      let monthlyQuotaTokens = null;
+      if (quotaRaw) {
+        const n = Number(quotaRaw.replace(/[, _]/g, ''));
+        if (!Number.isFinite(n) || n < 0) return toast('Quota must be a non-negative number', 'error');
+        monthlyQuotaTokens = Math.floor(n);
+      }
+      try {
+        const r = await fetch('/admin/tokens', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: authHeaders(),
+          body: JSON.stringify({ label, monthlyQuotaTokens, notes: notes || null }),
+        });
+        if (!r.ok) {
+          const txt = await r.text().catch(() => '');
+          throw new Error('HTTP ' + r.status + ' ' + txt.slice(0, 120));
+        }
+        const created = await r.json();
+        closeModal();
+        await loadTokens();
+        renderTab();
+        showSecretRevealModal(created);
+      } catch (e) {
+        toast('Error: ' + (e.message || e), 'error');
+      }
+    };
+  }
+
+  function showSecretRevealModal(created) {
+    const secret = created.secret || '';
+    const html = `
+      <div class="modal-overlay" data-modal-overlay>
+        <div class="modal" style="width:520px">
+          <div class="modal-header">
+            <h3>Token created — copy the secret now</h3>
+            <button class="modal-close" data-modal-close aria-label="Close">×</button>
+          </div>
+          <div class="modal-body">
+            <p style="margin:0 0 10px;color:var(--text-dim)">Label <strong style="color:var(--text)">${escHtml(created.label || '')}</strong></p>
+            <p style="margin:0 0 12px;color:var(--warn);font-size:12px">This secret is only shown once. Save it now — the dashboard cannot recover it later.</p>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+              <input id="reveal-secret" class="mono" readonly value="${escAttr(secret)}" style="flex:1;height:36px;padding:0 12px;background:var(--surface-2);border:1px solid var(--border-strong);border-radius:7px;color:var(--text);font-size:12px">
+              <button class="btn primary" id="btn-copy-secret"><svg><use href="#i-copy"/></svg>Copy</button>
+            </div>
+            <p class="mono dim" style="margin:0 0 8px;font-size:11px">Use it as: <code>Authorization: Bearer ${escHtml(secret)}</code></p>
+            <div class="form-actions">
+              <button class="btn primary" data-modal-close>Done</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById('modal-container').innerHTML = html;
+    wireModalClose();
+    const input = document.getElementById('reveal-secret');
+    input.focus(); input.select();
+    document.getElementById('btn-copy-secret').onclick = async () => {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(secret);
+        } else {
+          input.select(); document.execCommand('copy');
+        }
+        toast('Secret copied to clipboard');
+      } catch (e) {
+        input.select(); document.execCommand('copy');
+        toast('Secret copied');
+      }
+    };
+  }
+
+  function openTokenEditModal(t) {
+    const html = `
+      <div class="modal-overlay" data-modal-overlay>
+        <div class="modal">
+          <div class="modal-header">
+            <h3>Edit token · ${escHtml(t.label || '')}</h3>
+            <button class="modal-close" data-modal-close aria-label="Close">×</button>
+          </div>
+          <div class="modal-body">
+            <div class="form-group">
+              <label>Monthly quota (tokens)</label>
+              <input type="text" id="tef-quota" inputmode="numeric" placeholder="Leave empty for unlimited" value="${t.monthly_quota_tokens == null ? '' : t.monthly_quota_tokens}">
+            </div>
+            <div class="form-group">
+              <label>Notes</label>
+              <input type="text" id="tef-notes" placeholder="Internal note" value="${escAttr(t.notes || '')}">
+            </div>
+            <div class="form-group">
+              <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;color:var(--text)">
+                <input type="checkbox" id="tef-active" ${t.active ? 'checked' : ''}> Active (uncheck to revoke)
+              </label>
+            </div>
+            <div class="form-actions">
+              <button class="btn" data-modal-close>Cancel</button>
+              <button class="btn primary" id="btn-update-token">Update</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById('modal-container').innerHTML = html;
+    wireModalClose();
+    document.getElementById('btn-update-token').onclick = async () => {
+      const quotaRaw = document.getElementById('tef-quota').value.trim();
+      const notes = document.getElementById('tef-notes').value.trim();
+      const active = document.getElementById('tef-active').checked;
+      let monthlyQuotaTokens = null;
+      if (quotaRaw === '') {
+        monthlyQuotaTokens = null;
+      } else {
+        const n = Number(quotaRaw.replace(/[, _]/g, ''));
+        if (!Number.isFinite(n) || n < 0) return toast('Quota must be a non-negative number', 'error');
+        monthlyQuotaTokens = Math.floor(n);
+      }
+      try {
+        const r = await fetch(`/admin/tokens/${t.id}`, {
+          method: 'PATCH',
+          credentials: 'same-origin',
+          headers: authHeaders(),
+          body: JSON.stringify({ monthlyQuotaTokens, notes: notes || null, active }),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        toast('Token updated');
+        closeModal();
+        await loadTokens();
+        renderTab();
+      } catch (e) { toast('Error: ' + e.message, 'error'); }
+    };
+  }
+
+  function confirmTokenAction(action, id, label) {
+    const isReset = action === 'reset';
+    const title = isReset ? 'Reset monthly usage?' : 'Revoke token?';
+    const sub = isReset
+      ? `The counter for <strong style="color:var(--text)">${escHtml(label || '')}</strong> will be set to zero. Existing access continues.`
+      : `<strong style="color:var(--text)">${escHtml(label || '')}</strong> will lose access immediately. This cannot be undone from the dashboard.`;
+    const btnLabel = isReset ? 'Reset usage' : 'Revoke';
+    const btnClass = isReset ? 'primary' : 'danger';
+    const html = `
+      <div class="modal-overlay" data-modal-overlay>
+        <div class="modal" style="width:420px">
+          <div class="modal-header">
+            <h3>${title}</h3>
+            <button class="modal-close" data-modal-close aria-label="Close">×</button>
+          </div>
+          <div class="modal-body">
+            <p style="margin:0 0 16px;color:var(--text-dim)">${sub}</p>
+            <div class="form-actions">
+              <button class="btn" data-modal-close>Cancel</button>
+              <button class="btn ${btnClass}" id="btn-confirm-token">${btnLabel}</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById('modal-container').innerHTML = html;
+    wireModalClose();
+    document.getElementById('btn-confirm-token').onclick = async () => {
+      try {
+        const url = isReset ? `/admin/tokens/${id}/reset-usage` : `/admin/tokens/${id}`;
+        const r = await fetch(url, {
+          method: isReset ? 'POST' : 'DELETE',
+          credentials: 'same-origin',
+          headers: authHeaders(),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        toast(isReset ? 'Usage reset' : 'Token revoked');
+        closeModal();
+        await loadTokens();
+        renderTab();
+      } catch (e) { toast('Error: ' + e.message, 'error'); }
+    };
+  }
+
+  /* ====================================================================
    *  CALL LOG
    * ==================================================================== */
   function renderLog() {
@@ -2154,6 +2499,20 @@
       if (el) el.textContent = String(state.apiKeys.length);
     } catch (e) { console.error('loadApiKeys:', e); state.apiKeys = []; }
   }
+  async function loadTokens() {
+    try {
+      const data = await api('/admin/tokens');
+      state.tokens = Array.isArray(data) ? data : [];
+      const el = document.getElementById('nav-tokens-count');
+      if (el) el.textContent = String(state.tokens.length);
+    } catch (e) {
+      // /admin/tokens returns 401 without a session, but loadTokens runs in
+      // bootstrap before the user has explicitly opened the tab. Don't blow
+      // up the dashboard — the tab itself will show an empty state.
+      console.error('loadTokens:', e);
+      state.tokens = [];
+    }
+  }
 
   function setOnline(ok) {
     state.online = ok;
@@ -2191,6 +2550,7 @@
       loadCalls(false),
       loadModels(),
       loadApiKeys(),
+      loadTokens(),
     ]);
     renderTab();
   }
@@ -2211,10 +2571,18 @@
         await Promise.all([loadSummary(), loadUsageDaily(), loadModelRollup(), loadCalls(false)]);
         if (state.tab === 'models') await loadModels();
         if (state.tab === 'keys') await loadApiKeys();
+        if (state.tab === 'tokens') await loadTokens();
         renderTab();
       } finally {
         setTimeout(() => btn.classList.remove('spinning'), 800);
       }
+    });
+    const logoutBtn = document.getElementById('btn-logout');
+    if (logoutBtn) logoutBtn.addEventListener('click', async () => {
+      try {
+        await fetch('/dashboard/logout', { method: 'POST', credentials: 'same-origin' });
+      } catch (_) { /* still navigate even if request failed */ }
+      location.href = '/dashboard/login';
     });
     bootstrap();
 
@@ -2252,6 +2620,9 @@
               : state.usageDaily.map(d => Number(d.requests) || 0);
             state.charts.usageLine.update('none');
           }
+        } else if (state.tab === 'tokens') {
+          await loadTokens();
+          renderTab();
         }
       } catch (e) { console.error('autoRefresh:', e); }
     }, 30000);

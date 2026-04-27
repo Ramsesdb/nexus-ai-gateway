@@ -3,15 +3,34 @@
  * Features: Health-aware load balancing, Circuit Breaker, Graceful Shutdown
  */
 
+import { createHmac, timingSafeEqual, scryptSync } from 'node:crypto';
 import { GroqService } from './services/groq';
 import { GeminiService } from './services/gemini';
 import { OpenRouterService } from './services/openrouter';
 import { CerebrasService } from './services/cerebras';
 import { CloudflareService } from './services/cloudflare';
 import { resolveRoute, type ResolvedRoute } from './services/router';
-import { initDatabase, getDb, logUsage, refreshModelConfigCache, getCachedModelProvider, maskKey, seedModels, seedApiKeys, type SeedKeyConfig } from './services/database';
+import {
+  initDatabase,
+  getDb,
+  logUsage,
+  refreshModelConfigCache,
+  getCachedModelProvider,
+  maskKey,
+  seedModels,
+  seedApiKeys,
+  findGatewayTokenBySecret,
+  incrementTokenUsage,
+  createGatewayToken,
+  listGatewayTokens,
+  revokeGatewayToken,
+  updateGatewayToken,
+  resetGatewayTokenUsage,
+  type SeedKeyConfig,
+} from './services/database';
 import type {
   AIService,
+  AuthContext,
   ChatMessage,
   ChatStreamChunk,
   ProviderType,
@@ -27,6 +46,16 @@ const CONFIG = {
 
   // Security: Master API Key (optional, but highly recommended for production)
   masterKey: process.env.NEXUS_MASTER_KEY || '',
+
+  // Security: Dashboard login (email + password). The HMAC secret signs the
+  // session cookie; the password hash is verified with Bun.password (bcrypt)
+  // or, when the hash is prefixed with `scrypt$`, with node:crypto scrypt.
+  // If any of the three is missing, dashboard auth is DISABLED and the
+  // dashboard remains publicly accessible (legacy behavior, with a warning).
+  dashboardEmail: (process.env.DASHBOARD_EMAIL || '').trim().toLowerCase(),
+  dashboardPasswordHash: process.env.DASHBOARD_PASSWORD_HASH || '',
+  dashboardSessionSecret: process.env.DASHBOARD_SESSION_SECRET || '',
+  dashboardSessionMaxAgeSec: 60 * 60 * 24 * 7, // 7 days
 
   // Security: CORS whitelist (comma-separated origins, or '*' for all)
   corsAllowedOrigins: (process.env.CORS_ORIGINS || '*').split(',').map(s => s.trim()),
@@ -648,6 +677,295 @@ console.log(`⚡ Circuit Breaker: ${CONFIG.circuitBreaker.failureThreshold} fail
 
 let dashboardHtml = '';
 
+// =============================================================================
+// DASHBOARD AUTH (login + signed session cookie)
+// =============================================================================
+
+/**
+ * Dashboard auth is "enabled" when all three of email, password hash and
+ * session secret are configured. Otherwise the dashboard remains public
+ * (legacy behavior — printed once at startup as a warning).
+ */
+const DASHBOARD_AUTH_ENABLED =
+  !!CONFIG.dashboardEmail && !!CONFIG.dashboardPasswordHash && !!CONFIG.dashboardSessionSecret;
+
+if (!DASHBOARD_AUTH_ENABLED) {
+  console.warn(
+    '[Dashboard] Login disabled — set DASHBOARD_EMAIL, DASHBOARD_PASSWORD_HASH and ' +
+    'DASHBOARD_SESSION_SECRET in .env to require authentication on /dashboard/*. ' +
+    'Generate them with: bun run scripts/hash-password.ts <password>'
+  );
+} else {
+  console.log(`🔐 Dashboard login required for ${CONFIG.dashboardEmail}`);
+}
+
+async function verifyDashboardPassword(password: string): Promise<boolean> {
+  const stored = CONFIG.dashboardPasswordHash;
+  if (!stored) return false;
+  try {
+    if (stored.startsWith('scrypt$')) {
+      // Format: scrypt$<saltHex>$<hashHex>
+      const parts = stored.split('$');
+      if (parts.length !== 3) return false;
+      const salt = Buffer.from(parts[1]!, 'hex');
+      const expected = Buffer.from(parts[2]!, 'hex');
+      const derived = scryptSync(password, salt, expected.length);
+      return derived.length === expected.length && timingSafeEqual(derived, expected);
+    }
+    // Bun.password.verify auto-detects bcrypt/argon2 from the hash prefix.
+    const verify = (Bun as any)?.password?.verify;
+    if (typeof verify === 'function') {
+      return await verify(password, stored);
+    }
+    return false;
+  } catch (err) {
+    console.error('[Dashboard] verifyDashboardPassword error:', err);
+    return false;
+  }
+}
+
+function signDashboardSession(email: string, expiresAtMs: number): string {
+  const session = `${email}.${expiresAtMs}`;
+  const signature = createHmac('sha256', CONFIG.dashboardSessionSecret).update(session).digest('hex');
+  return `${session}.${signature}`;
+}
+
+function verifyDashboardSession(req: Request): { valid: boolean; email?: string } {
+  if (!DASHBOARD_AUTH_ENABLED) return { valid: true, email: '(auth-disabled)' };
+  const cookieHeader = req.headers.get('Cookie') ?? '';
+  const match = cookieHeader.match(/(?:^|;\s*)dashboard_session=([^;]+)/);
+  if (!match) return { valid: false };
+
+  let value: string;
+  try {
+    value = decodeURIComponent(match[1]!);
+  } catch {
+    return { valid: false };
+  }
+  const lastDot = value.lastIndexOf('.');
+  if (lastDot <= 0) return { valid: false };
+
+  const session = value.slice(0, lastDot);
+  const signature = value.slice(lastDot + 1);
+  const expected = createHmac('sha256', CONFIG.dashboardSessionSecret).update(session).digest('hex');
+
+  let sigOk = false;
+  try {
+    const a = Buffer.from(signature, 'hex');
+    const b = Buffer.from(expected, 'hex');
+    sigOk = a.length === b.length && timingSafeEqual(a, b);
+  } catch {
+    sigOk = false;
+  }
+  if (!sigOk) return { valid: false };
+
+  // session = "<email>.<expiresAtMs>"
+  const sepIdx = session.lastIndexOf('.');
+  if (sepIdx <= 0) return { valid: false };
+  const email = session.slice(0, sepIdx);
+  const expStr = session.slice(sepIdx + 1);
+  const exp = parseInt(expStr, 10);
+  if (!Number.isFinite(exp) || Date.now() > exp) return { valid: false };
+
+  return { valid: true, email };
+}
+
+function buildSessionCookie(value: string, isSecure: boolean): string {
+  const parts = [
+    `dashboard_session=${encodeURIComponent(value)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Strict',
+    `Max-Age=${CONFIG.dashboardSessionMaxAgeSec}`,
+  ];
+  if (isSecure) parts.push('Secure');
+  return parts.join('; ');
+}
+
+function buildClearSessionCookie(isSecure: boolean): string {
+  const parts = [
+    'dashboard_session=',
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Strict',
+    'Max-Age=0',
+  ];
+  if (isSecure) parts.push('Secure');
+  return parts.join('; ');
+}
+
+function isHttpsRequest(req: Request, url: URL): boolean {
+  return (
+    url.protocol === 'https:' ||
+    req.headers.get('x-forwarded-proto')?.toLowerCase() === 'https'
+  );
+}
+
+function wantsHtml(req: Request): boolean {
+  const accept = req.headers.get('Accept') || '';
+  return accept.includes('text/html');
+}
+
+function renderLoginPage(): string {
+  // Inline page with the same design tokens as dashboard.html.
+  return `<!doctype html>
+<html lang="es" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Login · Nexus AI Gateway</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg:#0B0D10; --surface:#0F1115; --surface-2:#13161B;
+    --border:#1A1D23; --border-strong:#252932;
+    --text:#E6E8EB; --text-dim:#9AA0A6; --text-muted:#6B7280;
+    --accent:#6BB4B0; --accent-soft:rgba(107,180,176,0.12); --accent-line:rgba(107,180,176,0.35);
+    --error:#F0524A; --error-soft:rgba(240,82,74,0.12);
+    --shadow-pop:0 1px 0 rgba(255,255,255,0.02) inset, 0 12px 32px -12px rgba(0,0,0,0.6);
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    font-size: 13px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    display: grid; place-items: center;
+    padding: 24px;
+  }
+  .login-card {
+    width: 100%; max-width: 380px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    box-shadow: var(--shadow-pop);
+    padding: 28px 28px 24px;
+  }
+  .brand-row { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
+  .brand-mark {
+    width: 26px; height: 26px;
+    border-radius: 7px;
+    background: linear-gradient(135deg, var(--accent) 0%, color-mix(in oklab, var(--accent) 60%, #000) 100%);
+    display: grid; place-items: center;
+    color: #fff; font-weight: 700; font-size: 12px;
+  }
+  .brand-name { font-weight: 600; font-size: 15px; letter-spacing: -0.005em; }
+  .brand-env { margin-left: auto; font-size: 10px; color: var(--text-muted); padding: 2px 6px; border: 1px solid var(--border-strong); border-radius: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { font-size: 13px; color: var(--text-muted); margin: 0 0 20px; }
+  .form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+  .form-group label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); font-weight: 500; }
+  input[type="email"], input[type="password"] {
+    height: 36px;
+    padding: 0 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    transition: border-color 80ms;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  input::placeholder { color: var(--text-muted); }
+  button[type="submit"] {
+    width: 100%;
+    height: 36px;
+    margin-top: 6px;
+    background: var(--accent);
+    color: #0B0D10;
+    border: 1px solid var(--accent);
+    border-radius: 7px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: filter 80ms;
+  }
+  button[type="submit"]:hover:not(:disabled) { filter: brightness(1.06); }
+  button[type="submit"]:disabled { opacity: 0.6; cursor: progress; }
+  .error {
+    margin-top: 12px;
+    padding: 8px 12px;
+    background: var(--error-soft);
+    border: 1px solid color-mix(in oklab, var(--error) 30%, transparent);
+    border-radius: 6px;
+    color: var(--error);
+    font-size: 12px;
+  }
+  .footer { margin-top: 16px; text-align: center; color: var(--text-muted); font-size: 11px; }
+</style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="brand-row">
+      <div class="brand-mark">N</div>
+      <div class="brand-name">Nexus</div>
+      <div class="brand-env">prod</div>
+    </div>
+    <h1>Acceder al dashboard</h1>
+    <p class="sub">Solo administradores. Las sesiones duran 7 días.</p>
+    <form id="loginForm" autocomplete="on">
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" placeholder="you@example.com" required autofocus autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" placeholder="••••••••" required autocomplete="current-password">
+      </div>
+      <button id="submitBtn" type="submit">Entrar</button>
+      <div id="error" class="error" hidden></div>
+    </form>
+    <div class="footer">Nexus AI Gateway</div>
+  </div>
+<script>
+(function () {
+  var form = document.getElementById('loginForm');
+  var errorEl = document.getElementById('error');
+  var btn = document.getElementById('submitBtn');
+  form.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    errorEl.hidden = true;
+    btn.disabled = true;
+    btn.textContent = 'Verificando…';
+    try {
+      var res = await fetch('/dashboard/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: document.getElementById('email').value.trim(),
+          password: document.getElementById('password').value,
+        }),
+      });
+      if (res.ok) {
+        var dest = new URLSearchParams(location.search).get('next') || '/dashboard';
+        window.location.href = dest;
+        return;
+      }
+      var msg = 'Credenciales inválidas';
+      try { var data = await res.json(); if (data && data.error) msg = data.error; } catch (_) {}
+      errorEl.textContent = msg;
+      errorEl.hidden = false;
+    } catch (_) {
+      errorEl.textContent = 'No se pudo contactar al servidor';
+      errorEl.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Entrar';
+    }
+  });
+})();
+</script>
+</body>
+</html>`;
+}
+
 (async () => {
   try {
     dashboardHtml = await Bun.file('./dashboard.html').text();
@@ -693,7 +1011,96 @@ const server = Bun.serve({
       return new Response(null, { headers: corsHeaders });
     }
 
-    // --- DASHBOARD ROUTES (no auth required) ---
+    // --- DASHBOARD AUTH (login / logout) ------------------------------------
+    // These three endpoints are always reachable so users can sign in/out.
+    // Everything else under /dashboard/* is gated by the session check below.
+
+    // Login form (GET)
+    if (req.method === 'GET' && url.pathname === '/dashboard/login') {
+      // If already signed in, bounce straight to the dashboard.
+      if (DASHBOARD_AUTH_ENABLED && verifyDashboardSession(req).valid) {
+        return new Response(null, { status: 302, headers: { Location: '/dashboard', ...corsHeaders } });
+      }
+      return new Response(renderLoginPage(), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
+      });
+    }
+
+    // Login submit (POST)
+    if (req.method === 'POST' && url.pathname === '/dashboard/login') {
+      if (!DASHBOARD_AUTH_ENABLED) {
+        // Login is meaningless when auth is off; succeed quietly so the UI can move on.
+        return new Response(JSON.stringify({ ok: true, authDisabled: true }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+      let email = '';
+      let password = '';
+      try {
+        const body = await req.json() as { email?: string; password?: string };
+        email = (body?.email || '').trim().toLowerCase();
+        password = body?.password || '';
+      } catch {
+        return new Response(
+          JSON.stringify({ error: 'Invalid request body' }),
+          { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+
+      // Constant-ish delay to mute timing attacks across both branches.
+      const delay = new Promise(res => setTimeout(res, 200));
+      const emailMatches = email === CONFIG.dashboardEmail;
+      const passwordMatches = emailMatches && (await verifyDashboardPassword(password));
+      await delay;
+
+      if (!emailMatches || !passwordMatches) {
+        return new Response(
+          JSON.stringify({ error: 'Invalid credentials' }),
+          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+
+      const expiresAtMs = Date.now() + CONFIG.dashboardSessionMaxAgeSec * 1000;
+      const cookieValue = signDashboardSession(CONFIG.dashboardEmail, expiresAtMs);
+      const setCookie = buildSessionCookie(cookieValue, isHttpsRequest(req, url));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json', 'Set-Cookie': setCookie, ...corsHeaders },
+      });
+    }
+
+    // Logout (POST)
+    if (req.method === 'POST' && url.pathname === '/dashboard/logout') {
+      const setCookie = buildClearSessionCookie(isHttpsRequest(req, url));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json', 'Set-Cookie': setCookie, ...corsHeaders },
+      });
+    }
+
+    // --- DASHBOARD SESSION GATE ----------------------------------------------
+    // Every /dashboard/* path that isn't login/logout requires a valid signed
+    // session cookie when DASHBOARD_AUTH_ENABLED. HTML navigations get a 302
+    // back to /dashboard/login; XHR/fetch callers get a 401 JSON body.
+    if (
+      DASHBOARD_AUTH_ENABLED &&
+      (url.pathname === '/dashboard' || url.pathname.startsWith('/dashboard/'))
+    ) {
+      const session = verifyDashboardSession(req);
+      if (!session.valid) {
+        if (wantsHtml(req)) {
+          const next = encodeURIComponent(url.pathname + (url.search || ''));
+          return new Response(null, {
+            status: 302,
+            headers: { Location: `/dashboard/login?next=${next}`, ...corsHeaders },
+          });
+        }
+        return new Response(
+          JSON.stringify({ error: 'Unauthorized', loginRequired: true }),
+          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+    }
+
+    // --- DASHBOARD ROUTES (now session-gated above when auth is enabled) -----
 
     // Serve dashboard HTML page
     if (req.method === 'GET' && url.pathname === '/dashboard') {
@@ -935,16 +1342,249 @@ const server = Bun.serve({
       }
     }
 
-    // --- SECURITY: Master Key Authentication ---
-    // Skip auth for health check and dashboard routes
-    if (CONFIG.masterKey && url.pathname !== '/health' && !url.pathname.startsWith('/dashboard')) {
+    // --- SECURITY: Authentication (master key OR per-user gateway token) ---
+    // Skip auth for /health and /dashboard/* (the dashboard remains admin-only by
+    // virtue of where it is hosted; admins are expected to put it behind a private
+    // route or proxy). The /admin/* surface, by contrast, is strictly master-only.
+    let authContext: AuthContext | null = null;
+    const requiresAuth =
+      CONFIG.masterKey &&
+      url.pathname !== '/health' &&
+      !url.pathname.startsWith('/dashboard');
+
+    // Endpoints that must always be authenticated by the master key, never by a
+    // per-user gateway token. Includes the new /admin/* surface and existing
+    // mutation-only routes that change global gateway state.
+    const adminOnlyPath =
+      url.pathname.startsWith('/admin/') ||
+      url.pathname === '/v1/providers/toggle';
+
+    if (requiresAuth) {
       const authHeader = req.headers.get('Authorization');
-      if (authHeader !== `Bearer ${CONFIG.masterKey}`) {
+      const bearer = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+
+      // A valid dashboard session counts as MASTER for /admin/* — this lets
+      // the logged-in dashboard call /admin/tokens without ever surfacing the
+      // master key in the browser. The session cookie is HttpOnly + signed,
+      // so it cannot be read or forged from JS. The cookie is NOT honored
+      // for /v1/* (clients there must continue to use the bearer key).
+      if (
+        adminOnlyPath &&
+        DASHBOARD_AUTH_ENABLED &&
+        verifyDashboardSession(req).valid
+      ) {
+        authContext = { type: 'master' };
+      }
+
+      if (!authContext && !bearer) {
         return new Response(
           JSON.stringify({
             error: { message: 'Unauthorized: Invalid or missing API key', type: 'authentication_error' },
           }),
           { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+
+      if (!authContext && bearer === CONFIG.masterKey) {
+        authContext = { type: 'master' };
+      } else if (!authContext && bearer && !adminOnlyPath) {
+        // Try to resolve as a per-user gateway token. Only allowed on non-admin paths.
+        const token = await findGatewayTokenBySecret(bearer);
+        if (token && token.active === 1) {
+          if (
+            token.monthly_quota_tokens != null &&
+            token.used_tokens_current_month >= token.monthly_quota_tokens
+          ) {
+            return new Response(
+              JSON.stringify({
+                error: {
+                  message: `Monthly quota exceeded for token '${token.label}'`,
+                  type: 'quota_exceeded',
+                  label: token.label,
+                  used: token.used_tokens_current_month,
+                  quota: token.monthly_quota_tokens,
+                },
+              }),
+              { status: 429, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+            );
+          }
+          authContext = {
+            type: 'token',
+            tokenId: token.id,
+            label: token.label,
+            monthlyQuota: token.monthly_quota_tokens,
+            used: token.used_tokens_current_month,
+          };
+        }
+      }
+
+      if (!authContext) {
+        return new Response(
+          JSON.stringify({
+            error: { message: 'Unauthorized: Invalid or missing API key', type: 'authentication_error' },
+          }),
+          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+    }
+
+    // --- ADMIN: Per-user gateway token management (master-key OR dashboard session) ---
+    // /admin/tokens* accepts either the master key (Authorization: Bearer)
+    // or a valid dashboard session cookie. The auth block above resolves
+    // both into authContext.type === 'master' before we reach these handlers.
+
+    if (req.method === 'POST' && url.pathname === '/admin/tokens') {
+      if (!getDb()) {
+        return new Response(
+          JSON.stringify({ error: { message: 'Database unavailable', type: 'service_unavailable' } }),
+          { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+      try {
+        const body = await req.json() as {
+          label?: string;
+          monthlyQuotaTokens?: number | null;
+          notes?: string | null;
+        };
+        if (!body || typeof body.label !== 'string' || !body.label.trim()) {
+          return new Response(
+            JSON.stringify({ error: { message: 'label is required', type: 'invalid_request_error' } }),
+            { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+          );
+        }
+        const created = await createGatewayToken(
+          body.label,
+          body.monthlyQuotaTokens === undefined ? null : body.monthlyQuotaTokens,
+          body.notes === undefined ? null : body.notes,
+        );
+        return new Response(
+          JSON.stringify({
+            id: created.id,
+            label: body.label.trim(),
+            secret: created.secret,
+            monthlyQuotaTokens:
+              body.monthlyQuotaTokens == null ? null : Math.max(0, Math.floor(body.monthlyQuotaTokens)),
+            quotaResetAt: created.quotaResetAt,
+            createdAt: new Date().toISOString(),
+          }),
+          { status: 201, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      } catch (err) {
+        console.error('[Admin/tokens POST]', err);
+        return new Response(
+          JSON.stringify({ error: { message: 'Failed to create token', type: 'internal_error' } }),
+          { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+    }
+
+    if (req.method === 'GET' && url.pathname === '/admin/tokens') {
+      if (!getDb()) {
+        return new Response(JSON.stringify([]), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+      try {
+        const tokens = await listGatewayTokens();
+        return new Response(JSON.stringify(tokens), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      } catch (err) {
+        console.error('[Admin/tokens GET]', err);
+        return new Response(JSON.stringify([]), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+    }
+
+    const tokenByIdMatch = url.pathname.match(/^\/admin\/tokens\/(\d+)$/);
+    if (tokenByIdMatch) {
+      const tokenId = parseInt(tokenByIdMatch[1]!, 10);
+      if (!getDb()) {
+        return new Response(
+          JSON.stringify({ error: { message: 'Database unavailable', type: 'service_unavailable' } }),
+          { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+
+      if (req.method === 'DELETE') {
+        try {
+          const result = await revokeGatewayToken(tokenId);
+          if (!result) {
+            return new Response(
+              JSON.stringify({ error: { message: 'Token not found', type: 'not_found' } }),
+              { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+            );
+          }
+          return new Response(JSON.stringify({ ok: true, label: result.label }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        } catch (err) {
+          console.error('[Admin/tokens DELETE]', err);
+          return new Response(
+            JSON.stringify({ error: { message: 'Failed to revoke token', type: 'internal_error' } }),
+            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+          );
+        }
+      }
+
+      if (req.method === 'PATCH') {
+        try {
+          const body = await req.json() as {
+            active?: boolean;
+            monthlyQuotaTokens?: number | null;
+            notes?: string | null;
+          };
+          const updated = await updateGatewayToken(tokenId, {
+            active: body?.active,
+            monthlyQuotaTokens: body?.monthlyQuotaTokens,
+            notes: body?.notes,
+          });
+          if (!updated) {
+            return new Response(
+              JSON.stringify({ error: { message: 'Nothing to update or token not found', type: 'invalid_request_error' } }),
+              { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+            );
+          }
+          return new Response(JSON.stringify({ ok: true }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        } catch (err) {
+          console.error('[Admin/tokens PATCH]', err);
+          return new Response(
+            JSON.stringify({ error: { message: 'Failed to update token', type: 'internal_error' } }),
+            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+          );
+        }
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname.match(/^\/admin\/tokens\/(\d+)\/reset-usage$/)) {
+      const m = url.pathname.match(/^\/admin\/tokens\/(\d+)\/reset-usage$/)!;
+      const tokenId = parseInt(m[1]!, 10);
+      if (!getDb()) {
+        return new Response(
+          JSON.stringify({ error: { message: 'Database unavailable', type: 'service_unavailable' } }),
+          { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        );
+      }
+      try {
+        const ok = await resetGatewayTokenUsage(tokenId);
+        if (!ok) {
+          return new Response(
+            JSON.stringify({ error: { message: 'Token not found', type: 'not_found' } }),
+            { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      } catch (err) {
+        console.error('[Admin/tokens reset-usage]', err);
+        return new Response(
+          JSON.stringify({ error: { message: 'Failed to reset usage', type: 'internal_error' } }),
+          { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
         );
       }
     }
@@ -1329,11 +1969,14 @@ const server = Bun.serve({
               const responsePreview = extractResponsePreview(
                 (completion as any)?.choices?.[0]?.message
               );
+              const tokensIn = usage?.prompt_tokens ?? 0;
+              const tokensOut = usage?.completion_tokens ?? 0;
+              const tokenIdAttr = authContext?.type === 'token' ? authContext.tokenId : null;
               logUsage({
                 model: serviceOptions.model || service.name,
                 provider: service.provider,
-                tokensInput: usage?.prompt_tokens ?? 0,
-                tokensOutput: usage?.completion_tokens ?? 0,
+                tokensInput: tokensIn,
+                tokensOutput: tokensOut,
                 durationMs: Date.now() - startTime,
                 success: 1,
                 originIp,
@@ -1341,7 +1984,11 @@ const server = Bun.serve({
                 userAgent,
                 requestPreview,
                 responsePreview,
+                tokenId: tokenIdAttr,
               });
+              if (tokenIdAttr != null) {
+                void incrementTokenUsage(tokenIdAttr, tokensIn + tokensOut);
+              }
 
               return new Response(JSON.stringify(completion), {
                 headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -1381,6 +2028,7 @@ const server = Bun.serve({
                 referer,
                 userAgent,
                 requestPreview,
+                tokenId: authContext?.type === 'token' ? authContext.tokenId : null,
               });
             }
           }
@@ -1640,11 +2288,14 @@ const server = Bun.serve({
                     recordSuccess(tracked);
                     const streamUsage1 = (service as any).lastStreamUsage;
                     const streamOriginIp1 = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+                    const stream1In = streamUsage1?.prompt_tokens ?? 0;
+                    const stream1Out = streamUsage1?.completion_tokens ?? 0;
+                    const stream1TokenId = authContext?.type === 'token' ? authContext.tokenId : null;
                     logUsage({
                       model: streamOptions.model || service.name,
                       provider: service.provider,
-                      tokensInput: streamUsage1?.prompt_tokens ?? 0,
-                      tokensOutput: streamUsage1?.completion_tokens ?? 0,
+                      tokensInput: stream1In,
+                      tokensOutput: stream1Out,
                       durationMs: Date.now() - startTime,
                       success: 1,
                       originIp: streamOriginIp1,
@@ -1652,7 +2303,11 @@ const server = Bun.serve({
                       userAgent,
                       requestPreview,
                       responsePreview: extractResponsePreview(undefined, responseContent, flattenedToolCalls()),
+                      tokenId: stream1TokenId,
                     });
+                    if (stream1TokenId != null) {
+                      void incrementTokenUsage(stream1TokenId, stream1In + stream1Out);
+                    }
                     // Emit metadata for non-streaming response too
                     emitMetadata(
                       service,
@@ -1686,11 +2341,14 @@ const server = Bun.serve({
                     recordSuccess(tracked);
                     const streamUsage2 = (service as any).lastStreamUsage;
                     const streamOriginIp2 = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+                    const stream2In = streamUsage2?.prompt_tokens ?? 0;
+                    const stream2Out = streamUsage2?.completion_tokens ?? 0;
+                    const stream2TokenId = authContext?.type === 'token' ? authContext.tokenId : null;
                     logUsage({
                       model: streamOptions.model || service.name,
                       provider: service.provider,
-                      tokensInput: streamUsage2?.prompt_tokens ?? 0,
-                      tokensOutput: streamUsage2?.completion_tokens ?? 0,
+                      tokensInput: stream2In,
+                      tokensOutput: stream2Out,
                       durationMs: Date.now() - startTime,
                       success: 1,
                       originIp: streamOriginIp2,
@@ -1698,7 +2356,11 @@ const server = Bun.serve({
                       userAgent,
                       requestPreview,
                       responsePreview: extractResponsePreview(undefined, responseContent, flattenedToolCalls()),
+                      tokenId: stream2TokenId,
                     });
+                    if (stream2TokenId != null) {
+                      void incrementTokenUsage(stream2TokenId, stream2In + stream2Out);
+                    }
                     break;
                   }
                 } catch (err) {
@@ -1742,6 +2404,7 @@ const server = Bun.serve({
                       const preview = extractResponsePreview(undefined, responseContent, flattenedToolCalls());
                       return preview === '(empty response)' ? undefined : preview;
                     })(),
+                    tokenId: authContext?.type === 'token' ? authContext.tokenId : null,
                   });
 
                   if (started) break;

@@ -180,3 +180,37 @@ export function hasImageContent(content: MessageContent): boolean {
   }
   return content.some(part => part.type === 'image_url');
 }
+
+// --- GATEWAY TOKEN / AUTH TYPES ---
+
+/**
+ * Per-user gateway token row. The `secret` is the full token value as stored
+ * in the DB; do not expose it after creation.
+ */
+export interface GatewayToken {
+  id: number;
+  label: string;
+  secret: string;
+  active: number; // 1 = active, 0 = revoked
+  monthly_quota_tokens: number | null;
+  used_tokens_current_month: number;
+  quota_reset_at: string | null;
+  created_at: string;
+  last_used_at: string | null;
+  notes: string | null;
+}
+
+/**
+ * Authentication context attached to a request after credential verification.
+ *  - `master`: validated against `NEXUS_MASTER_KEY`. Unrestricted.
+ *  - `token`: validated against a row in `gateway_tokens`. Quota-bound.
+ */
+export type AuthContext =
+  | { type: 'master' }
+  | {
+      type: 'token';
+      tokenId: number;
+      label: string;
+      monthlyQuota: number | null;
+      used: number;
+    };
