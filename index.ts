@@ -33,6 +33,7 @@ import type {
   AuthContext,
   ChatMessage,
   ChatStreamChunk,
+  GatewayToken,
   ProviderType,
   ServiceMetrics,
   ToolCallDelta,
@@ -49,7 +50,24 @@ import {
   circuitBreakerState,
   activeStreams,
   circuitStateToNumber,
+  ratelimitTotal,
 } from './metrics';
+import {
+  checkAndConsume,
+  configFromToken,
+  withRateLimitHeaders,
+  getEnvDefaults,
+  type BucketDecision,
+} from './services/rate-limiter';
+
+// Rate-limit env defaults are read once at module load (env doesn't change at
+// runtime). Kill switch lives here so the request handler can short-circuit
+// without entering the limiter.
+const rateLimitEnvDefaults = getEnvDefaults();
+
+// Routes that participate in token-based rate limiting. Exact match — unknown
+// `/v1/*` paths must NOT consume a bucket (see spec §4.1.6).
+const RATE_LIMITED_PATHS = new Set<string>(['/v1/chat/completions', '/v1/models']);
 
 // --- 1. CONFIGURATION ---
 const CONFIG = {
@@ -1383,6 +1401,10 @@ const server = Bun.serve({
     // virtue of where it is hosted; admins are expected to put it behind a private
     // route or proxy). The /admin/* surface, by contrast, is strictly master-only.
     let authContext: AuthContext | null = null;
+    // Loaded token row, captured here so the rate-limit block downstream can
+    // resolve per-token config without re-querying the DB. Stays null for
+    // master/session auth.
+    let authedToken: GatewayToken | null = null;
     const requiresAuth =
       CONFIG.masterKey &&
       url.pathname !== '/health' &&
@@ -1455,6 +1477,7 @@ const server = Bun.serve({
             monthlyQuota: token.monthly_quota_tokens,
             used: token.used_tokens_current_month,
           };
+          authedToken = token;
         }
       }
 
@@ -1466,6 +1489,64 @@ const server = Bun.serve({
           'authentication_error',
           corsHeaders,
         );
+      }
+    }
+
+    // --- SECURITY: Per-token rate limit (token-auth + rate-limited paths only) ---
+    // Runs AFTER auth + monthly-quota check, BEFORE route dispatch. Master and
+    // dashboard-session auth resolve to `type === 'master'` and bypass naturally.
+    // The `rateLimitDecision` is captured into request scope so downstream return
+    // points can attach `X-RateLimit-*` headers via `withRateLimitHeaders` (the
+    // SSE path bakes them into the streaming Response constructor instead).
+    let rateLimitDecision: BucketDecision | null = null;
+    if (
+      !rateLimitEnvDefaults.killSwitch &&
+      authContext?.type === 'token' &&
+      authedToken &&
+      RATE_LIMITED_PATHS.has(url.pathname)
+    ) {
+      const rlConfig = configFromToken(authedToken, rateLimitEnvDefaults);
+      const decision = checkAndConsume(authedToken.id, authedToken.label, rlConfig);
+      // Bypassed outcome (per-token disabled) leaves `rateLimitDecision` null so
+      // headers and counters are skipped — wire-level signal of bypass per spec §5.3.1.
+      if (decision.outcome !== 'bypassed') {
+        rateLimitDecision = decision;
+        ratelimitTotal.inc({ token_label: authedToken.label, outcome: decision.outcome });
+        if (!decision.allowed) {
+          const reqLog = requestLogger(crypto.randomUUID(), { path: url.pathname, method: req.method });
+          reqLog.info(
+            {
+              tag: 'RateLimit',
+              token_id: authedToken.id,
+              token_label: authedToken.label,
+              limit: rlConfig.perMinute,
+              burst: rlConfig.burst,
+              retry_after_seconds: decision.retryAfterSeconds,
+            },
+            'rate limit rejected',
+          );
+          return withRateLimitHeaders(
+            errorResponse(
+              429,
+              'RATE_LIMITED',
+              `Rate limit exceeded for token '${authedToken.label}'. Retry in ${decision.retryAfterSeconds} seconds.`,
+              'rate_limit_error',
+              corsHeaders,
+              {
+                extras: {
+                  retry_after_seconds: decision.retryAfterSeconds,
+                  limit: decision.limit,
+                  remaining: 0,
+                  window: 'minute',
+                },
+                headers: {
+                  'Retry-After': String(decision.retryAfterSeconds),
+                },
+              },
+            ),
+            decision,
+          );
+        }
       }
     }
 
@@ -1483,14 +1564,45 @@ const server = Bun.serve({
           label?: string;
           monthlyQuotaTokens?: number | null;
           notes?: string | null;
+          ratePerMinute?: number | null;
+          rateBurst?: number | null;
+          rateLimitDisabled?: boolean;
         };
         if (!body || typeof body.label !== 'string' || !body.label.trim()) {
           return errorResponse(400, 'INVALID_REQUEST', 'label is required', 'invalid_request_error', corsHeaders);
         }
+
+        // Rate-limit field validation. Accept: number (non-negative integer), null, or absent.
+        const validateOptionalNonNegativeInt = (v: unknown, field: string): number | null | { error: string } => {
+          if (v === undefined || v === null) return null;
+          if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+            return { error: `${field} must be a non-negative integer or null` };
+          }
+          return v;
+        };
+
+        const ratePerMinute = validateOptionalNonNegativeInt(body.ratePerMinute, 'ratePerMinute');
+        if (ratePerMinute !== null && typeof ratePerMinute === 'object') {
+          return errorResponse(400, 'INVALID_REQUEST', ratePerMinute.error, 'invalid_request_error', corsHeaders);
+        }
+        const rateBurst = validateOptionalNonNegativeInt(body.rateBurst, 'rateBurst');
+        if (rateBurst !== null && typeof rateBurst === 'object') {
+          return errorResponse(400, 'INVALID_REQUEST', rateBurst.error, 'invalid_request_error', corsHeaders);
+        }
+        if (body.rateLimitDisabled !== undefined && typeof body.rateLimitDisabled !== 'boolean') {
+          return errorResponse(400, 'INVALID_REQUEST', 'rateLimitDisabled must be a boolean', 'invalid_request_error', corsHeaders);
+        }
+        const rateLimitDisabled = body.rateLimitDisabled === true;
+
         const created = await createGatewayToken(
           body.label,
           body.monthlyQuotaTokens === undefined ? null : body.monthlyQuotaTokens,
           body.notes === undefined ? null : body.notes,
+          {
+            perMinute: ratePerMinute,
+            burst: rateBurst,
+            disabled: rateLimitDisabled,
+          },
         );
         return new Response(
           JSON.stringify({
@@ -1501,6 +1613,9 @@ const server = Bun.serve({
               body.monthlyQuotaTokens == null ? null : Math.max(0, Math.floor(body.monthlyQuotaTokens)),
             quotaResetAt: created.quotaResetAt,
             createdAt: new Date().toISOString(),
+            ratePerMinute,
+            rateBurst,
+            rateLimitDisabled,
           }),
           { status: 201, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
         );
@@ -1518,7 +1633,16 @@ const server = Bun.serve({
       }
       try {
         const tokens = await listGatewayTokens();
-        return new Response(JSON.stringify(tokens), {
+        // Project the rate-limit fields under camelCase keys (and convert the
+        // 0/1 disabled flag to JSON boolean) per spec §7.3. Existing snake_case
+        // fields are preserved for backward compat with current dashboard.html.
+        const projected = tokens.map(t => ({
+          ...t,
+          ratePerMinute: t.rate_limit_per_minute,
+          rateBurst: t.rate_limit_burst,
+          rateLimitDisabled: t.rate_limit_disabled === 1,
+        }));
+        return new Response(JSON.stringify(projected), {
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
       } catch (err) {
@@ -1558,12 +1682,58 @@ const server = Bun.serve({
             active?: boolean;
             monthlyQuotaTokens?: number | null;
             notes?: string | null;
+            ratePerMinute?: number | null;
+            rateBurst?: number | null;
+            rateLimitDisabled?: boolean;
           };
-          const updated = await updateGatewayToken(tokenId, {
+
+          // Tri-state validation: undefined = leave, null = clear, integer ≥ 0 = set.
+          const validateRate = (v: unknown, field: string): { ok: true; value: number | null | undefined } | { ok: false; error: string } => {
+            if (v === undefined) return { ok: true, value: undefined };
+            if (v === null) return { ok: true, value: null };
+            if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+              return { ok: false, error: `${field} must be a non-negative integer or null` };
+            }
+            return { ok: true, value: v };
+          };
+
+          const perMinResult = validateRate(body?.ratePerMinute, 'ratePerMinute');
+          if (!perMinResult.ok) {
+            return errorResponse(400, 'INVALID_REQUEST', perMinResult.error, 'invalid_request_error', corsHeaders);
+          }
+          const burstResult = validateRate(body?.rateBurst, 'rateBurst');
+          if (!burstResult.ok) {
+            return errorResponse(400, 'INVALID_REQUEST', burstResult.error, 'invalid_request_error', corsHeaders);
+          }
+          if (body?.rateLimitDisabled !== undefined && typeof body.rateLimitDisabled !== 'boolean') {
+            return errorResponse(400, 'INVALID_REQUEST', 'rateLimitDisabled must be a boolean', 'invalid_request_error', corsHeaders);
+          }
+
+          // Build the changes object, only including keys that were explicitly
+          // present in the body (so `undefined` ≠ `null` is preserved end-to-end).
+          const changes: {
+            active?: boolean;
+            monthlyQuotaTokens?: number | null;
+            notes?: string | null;
+            ratePerMinute?: number | null;
+            rateBurst?: number | null;
+            rateLimitDisabled?: boolean;
+          } = {
             active: body?.active,
             monthlyQuotaTokens: body?.monthlyQuotaTokens,
             notes: body?.notes,
-          });
+          };
+          if ('ratePerMinute' in (body ?? {})) {
+            changes.ratePerMinute = perMinResult.value;
+          }
+          if ('rateBurst' in (body ?? {})) {
+            changes.rateBurst = burstResult.value;
+          }
+          if (body?.rateLimitDisabled !== undefined) {
+            changes.rateLimitDisabled = body.rateLimitDisabled;
+          }
+
+          const updated = await updateGatewayToken(tokenId, changes);
           if (!updated) {
             return errorResponse(400, 'INVALID_REQUEST', 'Nothing to update or token not found', 'invalid_request_error', corsHeaders);
           }
@@ -1694,9 +1864,12 @@ const server = Bun.serve({
         ],
       };
 
-      return new Response(JSON.stringify(models), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      });
+      return withRateLimitHeaders(
+        new Response(JSON.stringify(models), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        }),
+        rateLimitDecision,
+      );
     }
 
     // Chat Completions
@@ -1728,6 +1901,12 @@ const server = Bun.serve({
           inFlightRequests--;
         }
       };
+
+      // Local helper: attach `X-RateLimit-*` headers to non-streaming responses
+      // returned from this handler. No-ops when the request was bypassed (master,
+      // session, per-token disabled, or kill switch). Streaming responses use
+      // a separate inline path that bakes the headers into `new Response(stream, ...)`.
+      const respond = (resp: Response) => withRateLimitHeaders(resp, rateLimitDecision);
 
       try {
         const body = await req.json() as {
@@ -1775,7 +1954,7 @@ const server = Bun.serve({
             'returning error: Invalid messages format',
           );
           recordRequestMetrics(400, 'INVALID_REQUEST');
-          return errorResponse(400, 'INVALID_REQUEST', 'Invalid messages format', 'invalid_request_error', corsHeaders);
+          return respond(errorResponse(400, 'INVALID_REQUEST', 'Invalid messages format', 'invalid_request_error', corsHeaders));
         }
 
         const typedMessages = messages as ChatMessage[];
@@ -1877,14 +2056,14 @@ const server = Bun.serve({
             `returning error: ${noCompatMsg}`,
           );
           recordRequestMetrics(400, 'NO_PROVIDER_AVAILABLE');
-          return errorResponse(
+          return respond(errorResponse(
             400,
             'NO_PROVIDER_AVAILABLE',
             noCompatMsg,
             'invalid_request_error',
             corsHeaders,
             { extras: { param: 'model' } },
-          );
+          ));
         }
 
         // Resolve a display-name pin ("Groq (Key #2)") to a specific tracked service.
@@ -1905,14 +2084,14 @@ const server = Bun.serve({
               `returning error: ${unknownMsg}`,
             );
             recordRequestMetrics(400, 'NO_PROVIDER_AVAILABLE');
-            return errorResponse(
+            return respond(errorResponse(
               400,
               'NO_PROVIDER_AVAILABLE',
               unknownMsg,
               'invalid_request_error',
               corsHeaders,
               { extras: { param: 'model' } },
-            );
+            ));
           }
           if (!pinnedTracked.enabled || !isServiceAvailable(pinnedTracked)) {
             inFlightRequests--;
@@ -1924,14 +2103,14 @@ const server = Bun.serve({
               `returning error: ${unavailMsg}`,
             );
             recordRequestMetrics(503, 'CIRCUIT_OPEN');
-            return errorResponse(
+            return respond(errorResponse(
               503,
               'CIRCUIT_OPEN',
               unavailMsg,
               'service_unavailable',
               corsHeaders,
               { extras: { param: 'model' } },
-            );
+            ));
           }
           // Strip the display-name string so base.ts:69 falls back to the service's default model.
           chatOptions.model = undefined;
@@ -2039,9 +2218,9 @@ const server = Bun.serve({
                 `[Router] non-streaming success via ${service.name}`,
               );
               recordRequestMetrics(200);
-              return new Response(JSON.stringify(completion), {
+              return respond(new Response(JSON.stringify(completion), {
                 headers: { 'Content-Type': 'application/json', ...corsHeaders },
-              });
+              }));
             } catch (err) {
               const errorMsg = err instanceof Error ? err.message : String(err);
               const status = extractHttpStatus(err);
@@ -2110,7 +2289,7 @@ const server = Bun.serve({
             `returning error: ${gatewayErrorMsg}`,
           );
           recordRequestMetrics(502, 'UPSTREAM_ERROR');
-          return errorResponse(502, 'UPSTREAM_ERROR', gatewayErrorMsg, 'gateway_error', corsHeaders);
+          return respond(errorResponse(502, 'UPSTREAM_ERROR', gatewayErrorMsg, 'gateway_error', corsHeaders));
         }
 
         activeStreams.inc();
@@ -2598,15 +2777,23 @@ const server = Bun.serve({
           },
         });
 
-        return new Response(stream, {
-          headers: {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no',
-            ...corsHeaders,
-          },
-        });
+        // SSE responses MUST NOT be cloned (cloning a streaming Response loses
+        // body-stream affinity in some runtimes). We bake `X-RateLimit-*`
+        // headers into the constructor headers directly when a decision is
+        // present — no post-hoc `withRateLimitHeaders` on this path.
+        const sseHeaders: Record<string, string> = {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+          ...corsHeaders,
+        };
+        if (rateLimitDecision && rateLimitDecision.outcome !== 'bypassed') {
+          sseHeaders['X-RateLimit-Limit'] = String(rateLimitDecision.limit);
+          sseHeaders['X-RateLimit-Remaining'] = String(rateLimitDecision.remaining);
+          sseHeaders['X-RateLimit-Reset'] = String(rateLimitDecision.resetSeconds);
+        }
+        return new Response(stream, { headers: sseHeaders });
       } catch (error) {
         if (!hasDecrementedInFlight) {
           hasDecrementedInFlight = true;
@@ -2621,7 +2808,7 @@ const server = Bun.serve({
           'returning error: Internal Error',
         );
         recordRequestMetrics(500, 'INTERNAL_ERROR');
-        return errorResponse(500, 'INTERNAL_ERROR', 'Internal Error', 'internal_error', corsHeaders);
+        return respond(errorResponse(500, 'INTERNAL_ERROR', 'Internal Error', 'internal_error', corsHeaders));
       } finally {
         decrementInFlight();
       }

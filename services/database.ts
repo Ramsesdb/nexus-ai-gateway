@@ -94,6 +94,11 @@ export async function initDatabase(): Promise<void> {
     await db.execute(`CREATE INDEX IF NOT EXISTS idx_gateway_tokens_secret ON gateway_tokens(secret)`);
     await db.execute(`CREATE INDEX IF NOT EXISTS idx_gateway_tokens_active ON gateway_tokens(active)`);
 
+    // Per-token rate-limit overrides. NULL → resolve to env defaults at runtime.
+    try { await db.execute(`ALTER TABLE gateway_tokens ADD COLUMN rate_limit_per_minute INTEGER`); } catch { /* column may already exist */ }
+    try { await db.execute(`ALTER TABLE gateway_tokens ADD COLUMN rate_limit_burst INTEGER`); } catch { /* column may already exist */ }
+    try { await db.execute(`ALTER TABLE gateway_tokens ADD COLUMN rate_limit_disabled INTEGER NOT NULL DEFAULT 0`); } catch { /* column may already exist */ }
+
     console.log('[Database] Connected and tables initialized.');
   } catch (err) {
     console.error('[Database] Connection failed:', err);
@@ -270,6 +275,9 @@ function rowToGatewayToken(r: any): GatewayToken {
     created_at: String(r.created_at),
     last_used_at: r.last_used_at == null ? null : String(r.last_used_at),
     notes: r.notes == null ? null : String(r.notes),
+    rate_limit_per_minute: r.rate_limit_per_minute == null ? null : Number(r.rate_limit_per_minute),
+    rate_limit_burst: r.rate_limit_burst == null ? null : Number(r.rate_limit_burst),
+    rate_limit_disabled: Number(r.rate_limit_disabled ?? 0) === 1 ? 1 : 0,
   };
 }
 
@@ -281,7 +289,7 @@ export async function findGatewayTokenBySecret(secret: string): Promise<GatewayT
   if (!db) return null;
   try {
     const result = await db.execute({
-      sql: 'SELECT id, label, secret, active, monthly_quota_tokens, used_tokens_current_month, quota_reset_at, created_at, last_used_at, notes FROM gateway_tokens WHERE secret = ? LIMIT 1',
+      sql: 'SELECT id, label, secret, active, monthly_quota_tokens, used_tokens_current_month, quota_reset_at, created_at, last_used_at, notes, rate_limit_per_minute, rate_limit_burst, rate_limit_disabled FROM gateway_tokens WHERE secret = ? LIMIT 1',
       args: [secret],
     });
     if (result.rows.length === 0) return null;
@@ -356,11 +364,20 @@ function generateTokenSecret(): string {
 /**
  * Create a new gateway token. Returns the freshly generated id + secret.
  * Throws if the DB is unavailable.
+ *
+ * The optional `rateLimit` block lets the caller persist per-token overrides:
+ * `perMinute` / `burst` may be a non-negative integer, `null`, or omitted
+ * (NULL → resolve to env default at runtime). `disabled` defaults to `false`.
  */
 export async function createGatewayToken(
   label: string,
   monthlyQuotaTokens?: number | null,
   notes?: string | null,
+  rateLimit?: {
+    perMinute?: number | null;
+    burst?: number | null;
+    disabled?: boolean;
+  },
 ): Promise<{ id: number; secret: string; quotaResetAt: string }> {
   if (!db) throw new Error('Database unavailable');
   const trimmedLabel = label.trim();
@@ -370,10 +387,14 @@ export async function createGatewayToken(
   const quotaResetAt = nextMonthlyResetIso();
   const quota = monthlyQuotaTokens == null ? null : Math.max(0, Math.floor(monthlyQuotaTokens));
 
+  const ratePerMinute = rateLimit?.perMinute == null ? null : Math.max(0, Math.floor(rateLimit.perMinute));
+  const rateBurst = rateLimit?.burst == null ? null : Math.max(0, Math.floor(rateLimit.burst));
+  const rateDisabled = rateLimit?.disabled === true ? 1 : 0;
+
   const result = await db.execute({
-    sql: `INSERT INTO gateway_tokens (label, secret, active, monthly_quota_tokens, used_tokens_current_month, quota_reset_at, notes)
-          VALUES (?, ?, 1, ?, 0, ?, ?)`,
-    args: [trimmedLabel, secret, quota, quotaResetAt, notes?.trim() || null],
+    sql: `INSERT INTO gateway_tokens (label, secret, active, monthly_quota_tokens, used_tokens_current_month, quota_reset_at, notes, rate_limit_per_minute, rate_limit_burst, rate_limit_disabled)
+          VALUES (?, ?, 1, ?, 0, ?, ?, ?, ?, ?)`,
+    args: [trimmedLabel, secret, quota, quotaResetAt, notes?.trim() || null, ratePerMinute, rateBurst, rateDisabled],
   });
 
   const id = Number(result.lastInsertRowid ?? 0);
@@ -396,7 +417,7 @@ export async function listGatewayTokens(): Promise<Array<Omit<GatewayToken, 'sec
   if (!db) return [];
   try {
     const result = await db.execute(
-      'SELECT id, label, secret, active, monthly_quota_tokens, used_tokens_current_month, quota_reset_at, created_at, last_used_at, notes FROM gateway_tokens ORDER BY id DESC'
+      'SELECT id, label, secret, active, monthly_quota_tokens, used_tokens_current_month, quota_reset_at, created_at, last_used_at, notes, rate_limit_per_minute, rate_limit_burst, rate_limit_disabled FROM gateway_tokens ORDER BY id DESC'
     );
     return result.rows.map((r: any) => {
       const tok = rowToGatewayToken(r);
@@ -429,10 +450,23 @@ export async function revokeGatewayToken(id: number): Promise<{ label: string } 
 /**
  * Partial update of a gateway token. Only provided fields are touched.
  * `monthlyQuotaTokens` may be passed as `null` to explicitly clear the quota.
+ *
+ * Rate-limit fields use tri-state semantics:
+ *   undefined → leave column as-is (no SET clause emitted)
+ *   null      → SET column = NULL (clear override; runtime resolves to env default)
+ *   number    → SET column = value
+ * `rateLimitDisabled: boolean` toggles the flag (true → 1, false → 0).
  */
 export async function updateGatewayToken(
   id: number,
-  changes: { active?: boolean; monthlyQuotaTokens?: number | null; notes?: string | null },
+  changes: {
+    active?: boolean;
+    monthlyQuotaTokens?: number | null;
+    notes?: string | null;
+    ratePerMinute?: number | null;
+    rateBurst?: number | null;
+    rateLimitDisabled?: boolean;
+  },
 ): Promise<boolean> {
   if (!db) throw new Error('Database unavailable');
   const sets: string[] = [];
@@ -449,6 +483,18 @@ export async function updateGatewayToken(
   if (changes.notes !== undefined) {
     sets.push('notes = ?');
     args.push(changes.notes == null ? null : (changes.notes.trim() || null));
+  }
+  if (changes.ratePerMinute !== undefined) {
+    sets.push('rate_limit_per_minute = ?');
+    args.push(changes.ratePerMinute == null ? null : Math.max(0, Math.floor(changes.ratePerMinute)));
+  }
+  if (changes.rateBurst !== undefined) {
+    sets.push('rate_limit_burst = ?');
+    args.push(changes.rateBurst == null ? null : Math.max(0, Math.floor(changes.rateBurst)));
+  }
+  if (changes.rateLimitDisabled !== undefined) {
+    sets.push('rate_limit_disabled = ?');
+    args.push(changes.rateLimitDisabled ? 1 : 0);
   }
 
   if (sets.length === 0) return false;

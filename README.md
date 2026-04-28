@@ -216,7 +216,7 @@ field is preserved for backward compatibility with OpenAI SDKs.
 | `AUTH_FORBIDDEN` | 403 | Reserved — credentials are valid but lack the required scope |
 | `NOT_FOUND` | 404 | Token id, provider name, or other named resource does not exist |
 | `QUOTA_EXCEEDED` | 429 | Per-user token has used its monthly quota |
-| `RATE_LIMITED` | 429 | Reserved — gateway-imposed rate limit (no current emitter) |
+| `RATE_LIMITED` | 429 | Gateway-imposed rate limit (see [Rate Limiting](#rate-limiting)) |
 | `INTERNAL_ERROR` | 500 | Unhandled exception inside the gateway |
 | `UPSTREAM_ERROR` | 502 | All compatible providers failed after retries (or, in streaming mode, mid-flight failure event) |
 | `SERVICE_UNAVAILABLE` | 503 | Server is shutting down or the database is unreachable |
@@ -228,6 +228,63 @@ after the SSE stream has already started is delivered as a single
 `[DONE]`.
 
 ---
+
+### Rate Limiting
+
+The gateway enforces a per-token token-bucket rate limit on `/v1/chat/completions`
+and `/v1/models` for token-authenticated requests. Master key and dashboard
+session requests bypass the limiter.
+
+**Defaults (env):**
+
+- `RATE_LIMIT_PER_MINUTE_DEFAULT` (default: `60`)
+- `RATE_LIMIT_BURST_DEFAULT` (default: `20`)
+- `RATE_LIMIT_DISABLED=1` disables the limiter globally (requires restart).
+
+**Per-token overrides (admin API):**
+
+- `ratePerMinute`: integer or `null` (use default)
+- `rateBurst`: integer or `null` (use default)
+- `rateLimitDisabled`: boolean (bypass limiter for this token)
+
+**Headers (delta-seconds, not Unix timestamps):**
+
+- `X-RateLimit-Limit`: effective per-minute capacity
+- `X-RateLimit-Remaining`: floor of current tokens after consume
+- `X-RateLimit-Reset`: seconds until bucket is full
+
+**429 shape + retry:**
+
+- Response body includes `error.code = "RATE_LIMITED"`, `retry_after_seconds`,
+  `limit`, `remaining: 0`, `window: "minute"`.
+- `Retry-After` is a delta-seconds integer (not an HTTP-date).
+
+**Caveats:**
+
+- Buckets are in-memory and reset on process restart (all tokens get full burst).
+- Multi-instance deployments are NOT safe with this design (effective limit
+  becomes N × configured limit).
+
+**Testing:**
+
+- Unit tests: `bun test` (uses bun:test).
+- Integration test for `/v1/chat/completions` rate limiting is not automated yet.
+
+**Manual smoke checks (recommended):**
+
+- Set `RATE_LIMIT_DISABLED=1`, restart, and confirm no `X-RateLimit-*` headers
+  and no 429s from the limiter.
+- With defaults, send 21 requests in 1s to `/v1/models` with the same token;
+  expect 20 OK and then one 429 `RATE_LIMITED`.
+
+**Admin API example (per-token override):**
+
+```bash
+curl -X PATCH http://localhost:3000/admin/tokens/123 \
+  -H "Authorization: Bearer $NEXUS_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "ratePerMinute": 30 }'
+```
 
 ### Observability
 
@@ -273,6 +330,10 @@ Exposed metrics:
 | `gateway_upstream_first_token_ms` | histogram | `provider` |
 | `gateway_circuit_breaker_state` | gauge (0=closed, 1=open, 2=half-open) | `provider` |
 | `gateway_active_streams` | gauge | — |
+| `gateway_ratelimit_total` | counter | `token_label`, `outcome` (`allowed`/`rejected`) |
+
+For `gateway_ratelimit_total`, keep `token_label` cardinality under ~50 tokens
+per deployment to avoid high label churn.
 
 Plus the default Node/Bun process metrics (`process_cpu_*`, `nodejs_eventloop_lag_seconds`, `nodejs_heap_size_*`, etc.) auto-collected by `prom-client`.
 
@@ -307,6 +368,11 @@ SHUTDOWN_TIMEOUT_MS=10000
 
 # Debug logs (off by default; set to 1 to surface incoming request + provider 4xx/5xx bodies)
 DEBUG=0
+
+# Rate limiting (per-token)
+RATE_LIMIT_PER_MINUTE_DEFAULT=60
+RATE_LIMIT_BURST_DEFAULT=20
+RATE_LIMIT_DISABLED=0
 
 # Groq (default: llama-4-scout)
 GROQ_MODEL=llama-4-scout-17b-16e-instruct

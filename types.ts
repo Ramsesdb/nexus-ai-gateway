@@ -198,6 +198,12 @@ export interface GatewayToken {
   created_at: string;
   last_used_at: string | null;
   notes: string | null;
+  /** Per-token rate limit override (requests per minute). NULL → use env default. */
+  rate_limit_per_minute: number | null;
+  /** Per-token burst capacity override. NULL → use env default. */
+  rate_limit_burst: number | null;
+  /** 1 = bypass rate limiter for this token; 0 = subject to limits. */
+  rate_limit_disabled: 0 | 1;
 }
 
 /**

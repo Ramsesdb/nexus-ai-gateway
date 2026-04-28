@@ -453,6 +453,19 @@
   }
   .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--accent); }
   .form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  .form-collapsible { border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); margin-bottom: 14px; }
+  .form-collapsible > summary { list-style: none; cursor: pointer; padding: 9px 12px; font-size: 12px; color: var(--text-dim); font-weight: 500; user-select: none; display: flex; align-items: center; gap: 8px; }
+  .form-collapsible > summary::-webkit-details-marker { display: none; }
+  .form-collapsible > summary::before { content: '›'; display: inline-block; transition: transform 120ms ease; color: var(--text-muted); font-size: 14px; line-height: 1; }
+  .form-collapsible[open] > summary::before { transform: rotate(90deg); }
+  .form-collapsible > summary:hover { color: var(--text); }
+  .form-collapsible-body { padding: 4px 12px 12px; border-top: 1px solid var(--border); }
+  .form-collapsible-body .form-group:last-child { margin-bottom: 0; }
+  .form-collapsible-body .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); padding-top: 4px; }
+  .rate-cell { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+  .rate-cell.is-default { font-style: italic; color: var(--text-muted); }
+  .rate-cell.is-disabled { color: var(--error); }
+  .rate-cell.is-override { color: var(--text); font-family: 'JetBrains Mono', monospace; }
 
   /* Modal */
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.55); backdrop-filter: blur(2px); z-index: 70; display: grid; place-items: center; padding: 20px; }
@@ -1977,6 +1990,7 @@
                 <th>Label</th>
                 <th>Status</th>
                 <th>This month</th>
+                <th>Rate</th>
                 <th>Last used</th>
                 <th>Secret</th>
                 <th class="dim">Created</th>
@@ -1985,6 +1999,11 @@
               <tbody>
                 ${list.map(t => {
                   const masked = t.secret_masked || t.secret || '—';
+                  const rateCell = t.rateLimitDisabled === true
+                    ? '<span class="rate-cell is-disabled">disabled</span>'
+                    : (t.ratePerMinute != null
+                      ? `<span class="rate-cell is-override">${t.ratePerMinute}/min · burst ${t.rateBurst != null ? t.rateBurst : '—'}</span>`
+                      : '<span class="rate-cell is-default">default</span>');
                   return `
                   <tr data-token-row data-tokenid="${t.id}">
                     <td>
@@ -1996,12 +2015,13 @@
                       <div class="mono num" style="font-size:12px">${fmtQuota(t.used_tokens_current_month, t.monthly_quota_tokens)}</div>
                       ${quotaBarHtml(t.used_tokens_current_month, t.monthly_quota_tokens)}
                     </td>
+                    <td>${rateCell}</td>
                     <td class="dim mono">${t.last_used_at ? fmtRel(t.last_used_at) : 'never'}</td>
                     <td class="mono dim">${escHtml(masked)}</td>
                     <td class="dim mono">${t.created_at ? new Date(t.created_at).toLocaleDateString() : '—'}</td>
                     <td class="right" onclick="event.stopPropagation()">
                       <span class="row-actions">
-                        <button class="btn xs" data-edit-token="${t.id}" data-label="${escAttr(t.label || '')}" data-quota="${t.monthly_quota_tokens == null ? '' : t.monthly_quota_tokens}" data-notes="${escAttr(t.notes || '')}" data-active="${t.active ? 1 : 0}" title="Edit"><svg><use href="#i-edit"/></svg></button>
+                        <button class="btn xs" data-edit-token="${t.id}" data-label="${escAttr(t.label || '')}" data-quota="${t.monthly_quota_tokens == null ? '' : t.monthly_quota_tokens}" data-notes="${escAttr(t.notes || '')}" data-active="${t.active ? 1 : 0}" data-rate-per-min="${t.ratePerMinute == null ? '' : t.ratePerMinute}" data-rate-burst="${t.rateBurst == null ? '' : t.rateBurst}" data-rate-disabled="${t.rateLimitDisabled === true ? 1 : 0}" title="Edit"><svg><use href="#i-edit"/></svg></button>
                         <button class="btn xs" data-reset-token="${t.id}" data-label="${escAttr(t.label || '')}" title="Reset usage this month"><svg><use href="#i-rotate"/></svg></button>
                         ${t.active ? `<button class="btn xs danger" data-revoke-token="${t.id}" data-label="${escAttr(t.label || '')}" title="Revoke"><svg><use href="#i-trash"/></svg></button>` : ''}
                       </span>
@@ -2033,6 +2053,9 @@
         monthly_quota_tokens: b.dataset.quota === '' ? null : Number(b.dataset.quota),
         notes: b.dataset.notes || '',
         active: parseInt(b.dataset.active, 10) === 1,
+        ratePerMinute: b.dataset.ratePerMin === '' ? null : Number(b.dataset.ratePerMin),
+        rateBurst: b.dataset.rateBurst === '' ? null : Number(b.dataset.rateBurst),
+        rateLimitDisabled: parseInt(b.dataset.rateDisabled, 10) === 1,
       }));
     });
     document.querySelectorAll('[data-reset-token]').forEach(b => {
@@ -2064,6 +2087,22 @@
               <label>Notes <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-muted)">(optional)</span></label>
               <input type="text" id="tf-notes" placeholder="Internal note, owner email…">
             </div>
+            <details class="form-collapsible">
+              <summary>Rate limit (optional)</summary>
+              <div class="form-collapsible-body">
+                <div class="form-group">
+                  <label>Requests per minute</label>
+                  <input type="text" id="tf-rate-per-min" inputmode="numeric" placeholder="Blank uses gateway default">
+                </div>
+                <div class="form-group">
+                  <label>Burst capacity</label>
+                  <input type="text" id="tf-rate-burst" inputmode="numeric" placeholder="Blank uses gateway default">
+                </div>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="tf-rate-disabled"> Disable rate limiting for this token
+                </label>
+              </div>
+            </details>
             <div class="form-actions">
               <button class="btn" data-modal-close>Cancel</button>
               <button class="btn primary" id="btn-save-token">Create</button>
@@ -2077,6 +2116,9 @@
       const label = document.getElementById('tf-label').value.trim();
       const quotaRaw = document.getElementById('tf-quota').value.trim();
       const notes = document.getElementById('tf-notes').value.trim();
+      const rpmRaw = document.getElementById('tf-rate-per-min').value.trim();
+      const rbRaw = document.getElementById('tf-rate-burst').value.trim();
+      const rateLimitDisabled = document.getElementById('tf-rate-disabled').checked;
       if (!label) return toast('Label is required', 'error');
       let monthlyQuotaTokens = null;
       if (quotaRaw) {
@@ -2084,12 +2126,24 @@
         if (!Number.isFinite(n) || n < 0) return toast('Quota must be a non-negative number', 'error');
         monthlyQuotaTokens = Math.floor(n);
       }
+      let ratePerMinute = null;
+      if (rpmRaw !== '') {
+        const n = Number(rpmRaw.replace(/[, _]/g, ''));
+        if (!Number.isFinite(n) || n < 0) return toast('Requests per minute must be a non-negative number', 'error');
+        ratePerMinute = Math.floor(n);
+      }
+      let rateBurst = null;
+      if (rbRaw !== '') {
+        const n = Number(rbRaw.replace(/[, _]/g, ''));
+        if (!Number.isFinite(n) || n < 0) return toast('Burst capacity must be a non-negative number', 'error');
+        rateBurst = Math.floor(n);
+      }
       try {
         const r = await fetch('/admin/tokens', {
           method: 'POST',
           credentials: 'same-origin',
           headers: authHeaders(),
-          body: JSON.stringify({ label, monthlyQuotaTokens, notes: notes || null }),
+          body: JSON.stringify({ label, monthlyQuotaTokens, notes: notes || null, ratePerMinute, rateBurst, rateLimitDisabled }),
         });
         if (!r.ok) {
           const txt = await r.text().catch(() => '');
@@ -2156,6 +2210,7 @@
   }
 
   function openTokenEditModal(t) {
+    const hasRateOverride = (t.ratePerMinute != null) || (t.rateBurst != null) || (t.rateLimitDisabled === true);
     const html = `
       <div class="modal-overlay" data-modal-overlay>
         <div class="modal">
@@ -2177,6 +2232,22 @@
                 <input type="checkbox" id="tef-active" ${t.active ? 'checked' : ''}> Active (uncheck to revoke)
               </label>
             </div>
+            <details class="form-collapsible" ${hasRateOverride ? 'open' : ''}>
+              <summary>Rate limit (optional)</summary>
+              <div class="form-collapsible-body">
+                <div class="form-group">
+                  <label>Requests per minute</label>
+                  <input type="text" id="tef-rate-per-min" inputmode="numeric" placeholder="Blank uses gateway default" value="${t.ratePerMinute == null ? '' : t.ratePerMinute}">
+                </div>
+                <div class="form-group">
+                  <label>Burst capacity</label>
+                  <input type="text" id="tef-rate-burst" inputmode="numeric" placeholder="Blank uses gateway default" value="${t.rateBurst == null ? '' : t.rateBurst}">
+                </div>
+                <label class="checkbox-row">
+                  <input type="checkbox" id="tef-rate-disabled" ${t.rateLimitDisabled === true ? 'checked' : ''}> Disable rate limiting for this token
+                </label>
+              </div>
+            </details>
             <div class="form-actions">
               <button class="btn" data-modal-close>Cancel</button>
               <button class="btn primary" id="btn-update-token">Update</button>
@@ -2190,6 +2261,9 @@
       const quotaRaw = document.getElementById('tef-quota').value.trim();
       const notes = document.getElementById('tef-notes').value.trim();
       const active = document.getElementById('tef-active').checked;
+      const rpmRaw = document.getElementById('tef-rate-per-min').value.trim();
+      const rbRaw = document.getElementById('tef-rate-burst').value.trim();
+      const rateLimitDisabled = document.getElementById('tef-rate-disabled').checked;
       let monthlyQuotaTokens = null;
       if (quotaRaw === '') {
         monthlyQuotaTokens = null;
@@ -2198,12 +2272,24 @@
         if (!Number.isFinite(n) || n < 0) return toast('Quota must be a non-negative number', 'error');
         monthlyQuotaTokens = Math.floor(n);
       }
+      let ratePerMinute = null;
+      if (rpmRaw !== '') {
+        const n = Number(rpmRaw.replace(/[, _]/g, ''));
+        if (!Number.isFinite(n) || n < 0) return toast('Requests per minute must be a non-negative number', 'error');
+        ratePerMinute = Math.floor(n);
+      }
+      let rateBurst = null;
+      if (rbRaw !== '') {
+        const n = Number(rbRaw.replace(/[, _]/g, ''));
+        if (!Number.isFinite(n) || n < 0) return toast('Burst capacity must be a non-negative number', 'error');
+        rateBurst = Math.floor(n);
+      }
       try {
         const r = await fetch(`/admin/tokens/${t.id}`, {
           method: 'PATCH',
           credentials: 'same-origin',
           headers: authHeaders(),
-          body: JSON.stringify({ monthlyQuotaTokens, notes: notes || null, active }),
+          body: JSON.stringify({ monthlyQuotaTokens, notes: notes || null, active, ratePerMinute, rateBurst, rateLimitDisabled }),
         });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         toast('Token updated');

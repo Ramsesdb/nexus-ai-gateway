@@ -56,6 +56,14 @@ export const activeStreams = new Gauge({
   registers: [registry],
 });
 
+export const ratelimitTotal = new Counter({
+  name: 'gateway_ratelimit_total',
+  help: 'Rate limit decisions per token',
+  // outcome: allowed | rejected (bypass paths do not increment)
+  labelNames: ['token_label', 'outcome'] as const,
+  registers: [registry],
+});
+
 /** Numeric encoding used by `circuitBreakerState`. */
 export function circuitStateToNumber(state: 'CLOSED' | 'OPEN' | 'HALF_OPEN'): number {
   switch (state) {
