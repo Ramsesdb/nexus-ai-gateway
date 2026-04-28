@@ -286,6 +286,41 @@ curl -X PATCH http://localhost:3000/admin/tokens/123 \
   -d '{ "ratePerMinute": 30 }'
 ```
 
+### Error Handling and Retry Classification
+
+When an upstream provider returns an error, the gateway classifies it as either
+`retryable` (rotate to the next compatible provider in the pool) or `failFast`
+(return an error to the client immediately, without burning latency on doomed
+retries). The classifier lives in `services/retry-classifier.ts` and is invoked
+by both the streaming and non-streaming paths of `/v1/chat/completions`.
+
+| Upstream status | Decision | Client `code` | Client HTTP | Notes |
+|---|---|---|---|---|
+| 400 | failFast | `INVALID_REQUEST` | 400 | Body parsed defensively for `error.message` |
+| 422 | failFast | `INVALID_REQUEST` | 400 | Mapped to 400 to align with the OpenAI shape |
+| 413 | failFast | `INVALID_REQUEST` | 413 | Status preserved (payload too large) |
+| 404 | failFast | `INVALID_REQUEST` | 400 | Treated as model-not-found |
+| 401 / 403 | failFast | `UPSTREAM_ERROR` | 502 | Generic surface message — body NOT echoed (avoids leaking gateway API keys) |
+| 408 | retryable | — | — | Upstream request timeout |
+| 409 | retryable | — | — | Defensive — rare in practice |
+| 429 | retryable | — | — | Provider rate limited; rotate keys |
+| 5xx | retryable | — | — | All 500-class statuses |
+| network / fetch failure | retryable | — | — | DNS, ECONNRESET, etc. |
+| timeout | retryable | — | — | Includes the gateway's first-token timeout |
+
+When all compatible providers exhaust the retryable pool, the gateway returns
+`502 UPSTREAM_ERROR` (non-streaming) or emits a single SSE error event with
+`code: "UPSTREAM_ERROR"` followed by `[DONE]` (streaming).
+
+**Known limitation:** some providers respond `200 OK` with an embedded error
+object on policy violations. The gateway currently treats this as success;
+clients must check `error` in the response body themselves. Planned for a
+future change.
+
+**Metric:** `gateway_retry_decisions_total{provider, decision, http_status_class}`
+counts classifier decisions; `decision` is `retryable | failFast` and
+`http_status_class` is `4xx | 5xx | network | timeout | other`.
+
 ### Observability
 
 The gateway emits **structured JSON logs** (one event per line) and exposes a

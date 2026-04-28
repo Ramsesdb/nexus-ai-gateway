@@ -64,6 +64,15 @@ export const ratelimitTotal = new Counter({
   registers: [registry],
 });
 
+export const retryDecisionsTotal = new Counter({
+  name: 'gateway_retry_decisions_total',
+  help: 'Retry classifier decisions per provider',
+  // decision: retryable | failFast
+  // http_status_class: 4xx | 5xx | network | timeout | other
+  labelNames: ['provider', 'decision', 'http_status_class'] as const,
+  registers: [registry],
+});
+
 /** Numeric encoding used by `circuitBreakerState`. */
 export function circuitStateToNumber(state: 'CLOSED' | 'OPEN' | 'HALF_OPEN'): number {
   switch (state) {

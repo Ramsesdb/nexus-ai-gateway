@@ -51,6 +51,7 @@ import {
   activeStreams,
   circuitStateToNumber,
   ratelimitTotal,
+  retryDecisionsTotal,
 } from './metrics';
 import {
   checkAndConsume,
@@ -59,6 +60,7 @@ import {
   getEnvDefaults,
   type BucketDecision,
 } from './services/rate-limiter';
+import { classifyUpstreamError, type UpstreamErrorKind } from './services/retry-classifier';
 
 // Rate-limit env defaults are read once at module load (env doesn't change at
 // runtime). Kill switch lives here so the request handler can short-circuit
@@ -452,6 +454,43 @@ const extractRetryAfter = (err: unknown): number | undefined => {
   if (!raw) return undefined;
   const n = Number(raw);
   return Number.isFinite(n) ? n : undefined;
+};
+
+/**
+ * Map an upstream error to the kind discriminator used by the retry
+ * classifier. First-token timeouts are surfaced via Error.message because
+ * they are produced inline by the streaming retry loop, not the OpenAI SDK.
+ */
+const classifyErrorKind = (err: unknown, status: number | undefined): UpstreamErrorKind => {
+  const msg = err instanceof Error ? err.message : '';
+  if (msg.startsWith('First token timeout')) return 'first-token-timeout';
+  if (typeof status === 'number' && status > 0) return 'http';
+  if (err && typeof err === 'object') {
+    const e = err as Record<string, unknown>;
+    const code = (e.code as string | undefined) || '';
+    const errno = (e.errno as string | undefined) || '';
+    if (
+      code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'ENOTFOUND'
+      || code === 'EAI_AGAIN' || code === 'EPIPE' || code === 'UND_ERR_SOCKET'
+      || errno === 'ECONNRESET' || errno === 'ECONNREFUSED'
+    ) {
+      return 'network';
+    }
+    if (code === 'ETIMEDOUT' || code === 'UND_ERR_HEADERS_TIMEOUT' || code === 'UND_ERR_BODY_TIMEOUT') {
+      return 'timeout';
+    }
+  }
+  if (/timeout/i.test(msg)) return 'timeout';
+  if (/fetch failed|network|socket|ENOTFOUND|ECONNRESET|ECONNREFUSED/i.test(msg)) return 'network';
+  return 'http';
+};
+
+const httpStatusClass = (status: number, kind: UpstreamErrorKind): '4xx' | '5xx' | 'network' | 'timeout' | 'other' => {
+  if (kind === 'network') return 'network';
+  if (kind === 'timeout' || kind === 'first-token-timeout') return 'timeout';
+  if (status >= 400 && status < 500) return '4xx';
+  if (status >= 500 && status < 600) return '5xx';
+  return 'other';
 };
 
 const extractRequestPreview = (messages: unknown): string => {
@@ -2278,6 +2317,37 @@ const server = Bun.serve({
                 requestPreview,
                 tokenId: authContext?.type === 'token' ? authContext.tokenId : null,
               });
+
+              const errKind = classifyErrorKind(err, status);
+              const decision = classifyUpstreamError({
+                status: status ?? 0,
+                bodyText: extractErrorBody(err),
+                providerName: service.name,
+                errorKind: errKind,
+              });
+              retryDecisionsTotal.inc({
+                provider: service.provider,
+                decision: decision.kind,
+                http_status_class: httpStatusClass(status ?? 0, errKind),
+              });
+              log.info(
+                { tag: 'RetryClassifier', provider_name: service.name, provider: service.provider, status: status ?? null, decision: decision.kind, reason: decision.reason },
+                `[RetryClassifier] ${service.name} status=${status ?? 'n/a'} -> ${decision.kind} (${decision.reason})`,
+              );
+              if (decision.kind === 'failFast') {
+                log.warn(
+                  { tag: 'GatewayReturningError', status: decision.httpStatus, error_code: decision.errorCode, provider_name: service.name, duration_ms: Date.now() - requestStartedAt },
+                  `returning error: ${decision.surfaceMessage}`,
+                );
+                recordRequestMetrics(decision.httpStatus, decision.errorCode);
+                return respond(errorResponse(
+                  decision.httpStatus,
+                  decision.errorCode,
+                  decision.surfaceMessage,
+                  decision.errorCode === 'INVALID_REQUEST' ? 'invalid_request_error' : 'gateway_error',
+                  corsHeaders,
+                ));
+              }
             }
           }
 
@@ -2342,6 +2412,7 @@ const server = Bun.serve({
             try {
               let started = false;
               let attemptNumber = 0;
+              let failFastEmitted = false;
 
               const emitChunk = (service: AIService, chunk: ChatStreamChunk) => {
                 if (typeof chunk !== 'string') {
@@ -2719,10 +2790,42 @@ const server = Bun.serve({
                   });
 
                   if (started) break;
+
+                  const errKind = classifyErrorKind(err, status);
+                  const decision = classifyUpstreamError({
+                    status: status ?? 0,
+                    bodyText: extractErrorBody(err),
+                    providerName: service.name,
+                    errorKind: errKind,
+                  });
+                  retryDecisionsTotal.inc({
+                    provider: service.provider,
+                    decision: decision.kind,
+                    http_status_class: httpStatusClass(status ?? 0, errKind),
+                  });
+                  log.info(
+                    { tag: 'RetryClassifier', provider_name: service.name, provider: service.provider, status: status ?? null, decision: decision.kind, reason: decision.reason },
+                    `[RetryClassifier] ${service.name} status=${status ?? 'n/a'} -> ${decision.kind} (${decision.reason})`,
+                  );
+                  // Pre-stream failFast: emit a single SSE error event with the
+                  // mapped error_code + clean message so the client sees the
+                  // classification (vs. a generic UPSTREAM_ERROR after rotating
+                  // the entire pool) and we don't burn latency on doomed
+                  // retries.
+                  if (decision.kind === 'failFast') {
+                    log.warn(
+                      { tag: 'GatewayReturningError', stream: true, status: decision.httpStatus, error_code: decision.errorCode, provider_name: service.name, duration_ms: Date.now() - requestStartedAt },
+                      `returning stream error: ${decision.surfaceMessage}`,
+                    );
+                    if (!metricsRecorded) recordRequestMetrics(decision.httpStatus, decision.errorCode);
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: decision.surfaceMessage, type: decision.errorCode === 'INVALID_REQUEST' ? 'invalid_request_error' : 'gateway_error', code: decision.errorCode } })}\n\n`));
+                    failFastEmitted = true;
+                    break;
+                  }
                 }
               }
 
-              if (!started && !aborted) {
+              if (!started && !aborted && !failFastEmitted) {
                 const streamErrMsg = route.isUniversal
                   ? 'All providers failed or circuits are open'
                   : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`;
