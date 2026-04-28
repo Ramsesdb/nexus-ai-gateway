@@ -196,6 +196,39 @@ curl -X POST http://localhost:3000/v1/providers/toggle \
 
 ---
 
+### Error Responses
+
+All error responses follow the OpenAI-compatible shape, with a stable
+machine-readable `code` field:
+
+```json
+{ "error": { "message": "...", "type": "...", "code": "QUOTA_EXCEEDED" } }
+```
+
+Branch on `code` rather than `message` (which is human-readable). The `type`
+field is preserved for backward compatibility with OpenAI SDKs.
+
+| `code` | HTTP | Meaning |
+|---|---|---|
+| `INVALID_REQUEST` | 400 | Malformed body, missing required fields, or a model the gateway cannot route |
+| `NO_PROVIDER_AVAILABLE` | 400 | No configured provider can serve the requested model |
+| `AUTH_INVALID` | 401 | Missing, invalid, or expired bearer token / dashboard session |
+| `AUTH_FORBIDDEN` | 403 | Reserved — credentials are valid but lack the required scope |
+| `NOT_FOUND` | 404 | Token id, provider name, or other named resource does not exist |
+| `QUOTA_EXCEEDED` | 429 | Per-user token has used its monthly quota |
+| `RATE_LIMITED` | 429 | Reserved — gateway-imposed rate limit (no current emitter) |
+| `INTERNAL_ERROR` | 500 | Unhandled exception inside the gateway |
+| `UPSTREAM_ERROR` | 502 | All compatible providers failed after retries (or, in streaming mode, mid-flight failure event) |
+| `SERVICE_UNAVAILABLE` | 503 | Server is shutting down or the database is unreachable |
+| `CIRCUIT_OPEN` | 503 | Pinned model is unavailable because its circuit breaker is open |
+
+For streaming requests (`text/event-stream`), an upstream failure that occurs
+after the SSE stream has already started is delivered as a single
+`data: { "error": { ..., "code": "UPSTREAM_ERROR" } }` event followed by
+`[DONE]`.
+
+---
+
 ## ⚙️ Configuration
 
 ### Environment Variables
@@ -208,6 +241,9 @@ CORS_ORIGIN=*
 # Timeouts
 FIRST_TOKEN_TIMEOUT_MS=8000
 SHUTDOWN_TIMEOUT_MS=10000
+
+# Debug logs (off by default; set to 1 to surface incoming request + provider 4xx/5xx bodies)
+DEBUG=0
 
 # Groq (default: llama-4-scout)
 GROQ_MODEL=llama-4-scout-17b-16e-instruct

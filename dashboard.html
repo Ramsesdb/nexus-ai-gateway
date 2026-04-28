@@ -726,14 +726,25 @@
     return fetch(path, { credentials: 'same-origin', headers, ...opts }).then(async r => {
       if (!r.ok) {
         const absUrl = (() => { try { return new URL(path, location.href).href; } catch (_) { return path; } })();
-        const err = new Error('HTTP ' + r.status + ' ' + absUrl);
+        let body = null;
+        try { body = await r.clone().json(); } catch (_) { /* body might not be JSON (proxy upstream errors, HTML pages, empty bodies) */ }
+        let serverMsg = null;
+        let serverCode = null;
+        if (body && body.error) {
+          if (typeof body.error === 'string') {
+            serverMsg = body.error;
+          } else {
+            serverMsg = body.error.message || null;
+            serverCode = body.error.code || null;
+          }
+        }
+        const err = new Error(serverMsg || ('HTTP ' + r.status + ' ' + absUrl));
         err.status = r.status; err.url = absUrl;
+        if (serverCode) err.code = serverCode;
         if (r.status === 401) {
           // Server now returns { loginRequired: true } when the dashboard
           // session cookie is missing or expired. Bounce to the login page so
           // the user can re-auth instead of staring at a broken dashboard.
-          let body = null;
-          try { body = await r.clone().json(); } catch (_) {}
           if (body && body.loginRequired) {
             const next = encodeURIComponent(location.pathname + location.search);
             location.href = '/dashboard/login?next=' + next;
@@ -2082,7 +2093,14 @@
         });
         if (!r.ok) {
           const txt = await r.text().catch(() => '');
-          throw new Error('HTTP ' + r.status + ' ' + txt.slice(0, 120));
+          let detail = txt.slice(0, 120);
+          try {
+            const data = JSON.parse(txt);
+            // fallback for legacy or non-handler errors
+            const errMsg = (typeof data?.error === 'string') ? data.error : (data?.error?.message ?? '');
+            if (errMsg) detail = errMsg;
+          } catch (_) {}
+          throw new Error('HTTP ' + r.status + ' ' + detail);
         }
         const created = await r.json();
         closeModal();

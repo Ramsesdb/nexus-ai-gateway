@@ -38,6 +38,10 @@ import type {
   ToolCallDelta,
   TrackedService,
 } from './types';
+import { errorResponse } from './errors';
+
+const DEBUG_ENABLED = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
+const dlog = (...args: unknown[]) => { if (DEBUG_ENABLED) console.warn(...args); };
 
 // --- 1. CONFIGURATION ---
 const CONFIG = {
@@ -949,7 +953,13 @@ function renderLoginPage(): string {
         return;
       }
       var msg = 'Credenciales inválidas';
-      try { var data = await res.json(); if (data && data.error) msg = data.error; } catch (_) {}
+      try {
+        var data = await res.json();
+        if (data && data.error) {
+          // fallback for legacy or non-handler errors
+          msg = (typeof data.error === 'string') ? data.error : (data.error.message || msg);
+        }
+      } catch (_) {}
       errorEl.textContent = msg;
       errorEl.hidden = false;
     } catch (_) {
@@ -986,9 +996,13 @@ const server = Bun.serve({
   async fetch(req) {
     // Reject new requests during shutdown
     if (isShuttingDown) {
-      return new Response(
-        JSON.stringify({ error: { message: 'Server is shutting down', type: 'service_unavailable' } }),
-        { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '30' } }
+      return errorResponse(
+        503,
+        'SERVICE_UNAVAILABLE',
+        'Server is shutting down',
+        'service_unavailable',
+        {},
+        { headers: { 'Retry-After': '30' } },
       );
     }
 
@@ -1041,10 +1055,7 @@ const server = Bun.serve({
         email = (body?.email || '').trim().toLowerCase();
         password = body?.password || '';
       } catch {
-        return new Response(
-          JSON.stringify({ error: 'Invalid request body' }),
-          { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        return errorResponse(400, 'INVALID_REQUEST', 'Invalid request body', 'invalid_request_error', corsHeaders);
       }
 
       // Constant-ish delay to mute timing attacks across both branches.
@@ -1054,10 +1065,7 @@ const server = Bun.serve({
       await delay;
 
       if (!emailMatches || !passwordMatches) {
-        return new Response(
-          JSON.stringify({ error: 'Invalid credentials' }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        return errorResponse(401, 'AUTH_INVALID', 'Invalid credentials', 'authentication_error', corsHeaders);
       }
 
       const expiresAtMs = Date.now() + CONFIG.dashboardSessionMaxAgeSec * 1000;
@@ -1093,9 +1101,13 @@ const server = Bun.serve({
             headers: { Location: `/dashboard/login?next=${next}`, ...corsHeaders },
           });
         }
-        return new Response(
-          JSON.stringify({ error: 'Unauthorized', loginRequired: true }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        return errorResponse(
+          401,
+          'AUTH_INVALID',
+          'Unauthorized',
+          'authentication_error',
+          corsHeaders,
+          { extras: { loginRequired: true } },
         );
       }
     }
@@ -1132,7 +1144,7 @@ const server = Bun.serve({
         }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
       } catch (err) {
         console.error('[Dashboard/summary]', err);
-        return new Response(JSON.stringify({ error: 'Query failed' }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        return errorResponse(500, 'INTERNAL_ERROR', 'Query failed', 'internal_error', corsHeaders);
       }
     }
 
@@ -1236,11 +1248,11 @@ const server = Bun.serve({
 
     if (req.method === 'POST' && url.pathname === '/dashboard/models') {
       const dbClient = getDb();
-      if (!dbClient) return new Response(JSON.stringify({ error: 'Database unavailable' }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      if (!dbClient) return errorResponse(503, 'SERVICE_UNAVAILABLE', 'Database unavailable', 'service_unavailable', corsHeaders);
       try {
         const body = await req.json() as { model_name?: string; provider?: string; active?: number };
         if (!body.model_name || !body.provider) {
-          return new Response(JSON.stringify({ error: { message: 'model_name and provider are required' } }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+          return errorResponse(400, 'INVALID_REQUEST', 'model_name and provider are required', 'invalid_request_error', corsHeaders);
         }
         await dbClient.execute({
           sql: `INSERT INTO model_config (model_name, provider, active) VALUES (?, ?, ?) ON CONFLICT(model_name) DO UPDATE SET provider=excluded.provider, active=excluded.active`,
@@ -1250,7 +1262,7 @@ const server = Bun.serve({
         return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
       } catch (err) {
         console.error('[Dashboard/models POST]', err);
-        return new Response(JSON.stringify({ error: { message: 'Failed to save model config' } }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        return errorResponse(500, 'INTERNAL_ERROR', 'Failed to save model config', 'internal_error', corsHeaders);
       }
     }
 
@@ -1258,12 +1270,12 @@ const server = Bun.serve({
     if (modelsByIdMatch) {
       const id = parseInt(modelsByIdMatch[1]!);
       const dbClient = getDb();
-      if (!dbClient) return new Response(JSON.stringify({ error: 'Database unavailable' }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      if (!dbClient) return errorResponse(503, 'SERVICE_UNAVAILABLE', 'Database unavailable', 'service_unavailable', corsHeaders);
       try {
         if (req.method === 'PUT') {
           const body = await req.json() as { model_name?: string; provider?: string; active?: number };
           if (!body.model_name || !body.provider || body.active === undefined) {
-            return new Response(JSON.stringify({ error: { message: 'model_name, provider, and active are required' } }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+            return errorResponse(400, 'INVALID_REQUEST', 'model_name, provider, and active are required', 'invalid_request_error', corsHeaders);
           }
           await dbClient.execute({
             sql: 'UPDATE model_config SET model_name=?, provider=?, active=? WHERE id=?',
@@ -1279,7 +1291,7 @@ const server = Bun.serve({
         }
       } catch (err) {
         console.error('[Dashboard/models/:id]', err);
-        return new Response(JSON.stringify({ error: { message: 'Failed' } }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        return errorResponse(500, 'INTERNAL_ERROR', 'Failed', 'internal_error', corsHeaders);
       }
     }
 
@@ -1298,11 +1310,11 @@ const server = Bun.serve({
 
     if (req.method === 'POST' && url.pathname === '/dashboard/api-keys') {
       const dbClient = getDb();
-      if (!dbClient) return new Response(JSON.stringify({ error: 'Database unavailable' }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      if (!dbClient) return errorResponse(503, 'SERVICE_UNAVAILABLE', 'Database unavailable', 'service_unavailable', corsHeaders);
       try {
         const body = await req.json() as { provider?: string; key_value?: string; account_id?: string; label?: string };
         if (!body.provider || !body.key_value) {
-          return new Response(JSON.stringify({ error: { message: 'provider and key_value are required' } }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+          return errorResponse(400, 'INVALID_REQUEST', 'provider and key_value are required', 'invalid_request_error', corsHeaders);
         }
         await dbClient.execute({
           sql: `INSERT INTO api_keys (provider, key_value, account_id, label) VALUES (?, ?, ?, ?)`,
@@ -1311,7 +1323,7 @@ const server = Bun.serve({
         return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
       } catch (err) {
         console.error('[Dashboard/api-keys POST]', err);
-        return new Response(JSON.stringify({ error: { message: 'Failed to save API key' } }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        return errorResponse(500, 'INTERNAL_ERROR', 'Failed to save API key', 'internal_error', corsHeaders);
       }
     }
 
@@ -1319,12 +1331,12 @@ const server = Bun.serve({
     if (keysByIdMatch) {
       const id = parseInt(keysByIdMatch[1]!);
       const dbClient = getDb();
-      if (!dbClient) return new Response(JSON.stringify({ error: 'Database unavailable' }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      if (!dbClient) return errorResponse(503, 'SERVICE_UNAVAILABLE', 'Database unavailable', 'service_unavailable', corsHeaders);
       try {
         if (req.method === 'PUT') {
           const body = await req.json() as { provider?: string; key_value?: string; account_id?: string; label?: string; active?: number };
           if (!body.provider || !body.key_value || body.active === undefined) {
-            return new Response(JSON.stringify({ error: { message: 'provider, key_value, and active are required' } }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+            return errorResponse(400, 'INVALID_REQUEST', 'provider, key_value, and active are required', 'invalid_request_error', corsHeaders);
           }
           await dbClient.execute({
             sql: 'UPDATE api_keys SET provider=?, key_value=?, account_id=?, label=?, active=? WHERE id=?',
@@ -1338,7 +1350,7 @@ const server = Bun.serve({
         }
       } catch (err) {
         console.error('[Dashboard/api-keys/:id]', err);
-        return new Response(JSON.stringify({ error: { message: 'Failed' } }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        return errorResponse(500, 'INTERNAL_ERROR', 'Failed', 'internal_error', corsHeaders);
       }
     }
 
@@ -1377,11 +1389,12 @@ const server = Bun.serve({
       }
 
       if (!authContext && !bearer) {
-        return new Response(
-          JSON.stringify({
-            error: { message: 'Unauthorized: Invalid or missing API key', type: 'authentication_error' },
-          }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        return errorResponse(
+          401,
+          'AUTH_INVALID',
+          'Unauthorized: Invalid or missing API key',
+          'authentication_error',
+          corsHeaders,
         );
       }
 
@@ -1395,17 +1408,19 @@ const server = Bun.serve({
             token.monthly_quota_tokens != null &&
             token.used_tokens_current_month >= token.monthly_quota_tokens
           ) {
-            return new Response(
-              JSON.stringify({
-                error: {
-                  message: `Monthly quota exceeded for token '${token.label}'`,
-                  type: 'quota_exceeded',
+            return errorResponse(
+              429,
+              'QUOTA_EXCEEDED',
+              `Monthly quota exceeded for token '${token.label}'`,
+              'quota_exceeded',
+              corsHeaders,
+              {
+                extras: {
                   label: token.label,
                   used: token.used_tokens_current_month,
                   quota: token.monthly_quota_tokens,
                 },
-              }),
-              { status: 429, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+              },
             );
           }
           authContext = {
@@ -1419,11 +1434,12 @@ const server = Bun.serve({
       }
 
       if (!authContext) {
-        return new Response(
-          JSON.stringify({
-            error: { message: 'Unauthorized: Invalid or missing API key', type: 'authentication_error' },
-          }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+        return errorResponse(
+          401,
+          'AUTH_INVALID',
+          'Unauthorized: Invalid or missing API key',
+          'authentication_error',
+          corsHeaders,
         );
       }
     }
@@ -1435,10 +1451,7 @@ const server = Bun.serve({
 
     if (req.method === 'POST' && url.pathname === '/admin/tokens') {
       if (!getDb()) {
-        return new Response(
-          JSON.stringify({ error: { message: 'Database unavailable', type: 'service_unavailable' } }),
-          { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        return errorResponse(503, 'SERVICE_UNAVAILABLE', 'Database unavailable', 'service_unavailable', corsHeaders);
       }
       try {
         const body = await req.json() as {
@@ -1447,10 +1460,7 @@ const server = Bun.serve({
           notes?: string | null;
         };
         if (!body || typeof body.label !== 'string' || !body.label.trim()) {
-          return new Response(
-            JSON.stringify({ error: { message: 'label is required', type: 'invalid_request_error' } }),
-            { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
+          return errorResponse(400, 'INVALID_REQUEST', 'label is required', 'invalid_request_error', corsHeaders);
         }
         const created = await createGatewayToken(
           body.label,
@@ -1471,10 +1481,7 @@ const server = Bun.serve({
         );
       } catch (err) {
         console.error('[Admin/tokens POST]', err);
-        return new Response(
-          JSON.stringify({ error: { message: 'Failed to create token', type: 'internal_error' } }),
-          { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        return errorResponse(500, 'INTERNAL_ERROR', 'Failed to create token', 'internal_error', corsHeaders);
       }
     }
 
@@ -1502,30 +1509,21 @@ const server = Bun.serve({
     if (tokenByIdMatch) {
       const tokenId = parseInt(tokenByIdMatch[1]!, 10);
       if (!getDb()) {
-        return new Response(
-          JSON.stringify({ error: { message: 'Database unavailable', type: 'service_unavailable' } }),
-          { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        return errorResponse(503, 'SERVICE_UNAVAILABLE', 'Database unavailable', 'service_unavailable', corsHeaders);
       }
 
       if (req.method === 'DELETE') {
         try {
           const result = await revokeGatewayToken(tokenId);
           if (!result) {
-            return new Response(
-              JSON.stringify({ error: { message: 'Token not found', type: 'not_found' } }),
-              { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-            );
+            return errorResponse(404, 'NOT_FOUND', 'Token not found', 'not_found', corsHeaders);
           }
           return new Response(JSON.stringify({ ok: true, label: result.label }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders },
           });
         } catch (err) {
           console.error('[Admin/tokens DELETE]', err);
-          return new Response(
-            JSON.stringify({ error: { message: 'Failed to revoke token', type: 'internal_error' } }),
-            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
+          return errorResponse(500, 'INTERNAL_ERROR', 'Failed to revoke token', 'internal_error', corsHeaders);
         }
       }
 
@@ -1542,20 +1540,14 @@ const server = Bun.serve({
             notes: body?.notes,
           });
           if (!updated) {
-            return new Response(
-              JSON.stringify({ error: { message: 'Nothing to update or token not found', type: 'invalid_request_error' } }),
-              { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-            );
+            return errorResponse(400, 'INVALID_REQUEST', 'Nothing to update or token not found', 'invalid_request_error', corsHeaders);
           }
           return new Response(JSON.stringify({ ok: true }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders },
           });
         } catch (err) {
           console.error('[Admin/tokens PATCH]', err);
-          return new Response(
-            JSON.stringify({ error: { message: 'Failed to update token', type: 'internal_error' } }),
-            { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
+          return errorResponse(500, 'INTERNAL_ERROR', 'Failed to update token', 'internal_error', corsHeaders);
         }
       }
     }
@@ -1564,28 +1556,19 @@ const server = Bun.serve({
       const m = url.pathname.match(/^\/admin\/tokens\/(\d+)\/reset-usage$/)!;
       const tokenId = parseInt(m[1]!, 10);
       if (!getDb()) {
-        return new Response(
-          JSON.stringify({ error: { message: 'Database unavailable', type: 'service_unavailable' } }),
-          { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        return errorResponse(503, 'SERVICE_UNAVAILABLE', 'Database unavailable', 'service_unavailable', corsHeaders);
       }
       try {
         const ok = await resetGatewayTokenUsage(tokenId);
         if (!ok) {
-          return new Response(
-            JSON.stringify({ error: { message: 'Token not found', type: 'not_found' } }),
-            { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
+          return errorResponse(404, 'NOT_FOUND', 'Token not found', 'not_found', corsHeaders);
         }
         return new Response(JSON.stringify({ ok: true }), {
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
       } catch (err) {
         console.error('[Admin/tokens reset-usage]', err);
-        return new Response(
-          JSON.stringify({ error: { message: 'Failed to reset usage', type: 'internal_error' } }),
-          { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        return errorResponse(500, 'INTERNAL_ERROR', 'Failed to reset usage', 'internal_error', corsHeaders);
       }
     }
 
@@ -1595,18 +1578,12 @@ const server = Bun.serve({
         const body = await req.json() as { name?: string; enabled?: boolean };
 
         if (!body?.name || typeof body.enabled !== 'boolean') {
-          return new Response(
-            JSON.stringify({ error: { message: 'Missing name or enabled flag', type: 'invalid_request_error' } }),
-            { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
+          return errorResponse(400, 'INVALID_REQUEST', 'Missing name or enabled flag', 'invalid_request_error', corsHeaders);
         }
 
         const target = trackedServices.find(ts => ts.service.name === body.name);
         if (!target) {
-          return new Response(
-            JSON.stringify({ error: { message: 'Provider not found', type: 'not_found' } }),
-            { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
+          return errorResponse(404, 'NOT_FOUND', 'Provider not found', 'not_found', corsHeaders);
         }
 
         target.enabled = body.enabled;
@@ -1622,10 +1599,7 @@ const server = Bun.serve({
         });
       } catch (error) {
         console.error('[Toggle Provider] Error parsing request', error);
-        return new Response(
-          JSON.stringify({ error: { message: 'Invalid JSON payload', type: 'invalid_request_error' } }),
-          { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        return errorResponse(400, 'INVALID_REQUEST', 'Invalid JSON payload', 'invalid_request_error', corsHeaders);
       }
     }
 
@@ -1748,20 +1722,16 @@ const server = Bun.serve({
             tools_count: Array.isArray(body.tools) ? (body.tools as unknown[]).length : undefined,
             tool_choice: body.tool_choice,
           });
-          console.warn('[IncomingRequest-Start]', summary.slice(0, 2500));
+          dlog('[IncomingRequest-Start]', summary.slice(0, 2500));
         } catch (logErr) {
-          console.warn('[IncomingRequest-Start] <serialize-failed>', logErr);
+          dlog('[IncomingRequest-Start] <serialize-failed>', logErr);
         }
 
         if (!Array.isArray(messages) || !messages.every(isValidMessage)) {
           inFlightRequests--;
           hasDecrementedInFlight = true;
-          const errorBody = JSON.stringify({ error: { message: 'Invalid messages format', type: 'invalid_request_error' } });
-          console.warn('[GatewayReturningError]', 400, errorBody);
-          return new Response(
-            errorBody,
-            { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
-          );
+          console.warn('[GatewayReturningError]', 400, 'INVALID_REQUEST', 'Invalid messages format');
+          return errorResponse(400, 'INVALID_REQUEST', 'Invalid messages format', 'invalid_request_error', corsHeaders);
         }
 
         const typedMessages = messages as ChatMessage[];
@@ -1793,8 +1763,8 @@ const server = Bun.serve({
               : body.tool_choice === undefined
                 ? '(none)'
                 : (() => { try { return JSON.stringify(body.tool_choice); } catch { return '<unserializable>'; } })();
-          console.warn(`[ProviderErrorBody] ${serviceName} status=${status} body=${errBody}`);
-          console.warn(`[IncomingRequest] messages=${msgs} tools_count=${toolsCount} tool_choice=${toolChoice} model=${resolvedModel ?? '(none)'}`);
+          dlog(`[ProviderErrorBody] ${serviceName} status=${status} body=${errBody}`);
+          dlog(`[IncomingRequest] messages=${msgs} tools_count=${toolsCount} tool_choice=${toolChoice} model=${resolvedModel ?? '(none)'}`);
         };
 
         const onAbort = () => { aborted = true; };
@@ -1842,17 +1812,15 @@ const server = Bun.serve({
           inFlightRequests--;
           hasDecrementedInFlight = true;
           const supported = [...configuredProviders].join(', ');
-          const noCompatBody = JSON.stringify({
-            error: {
-              message: `No compatible provider is configured for model '${body.model}'. Available providers: ${supported}.`,
-              type: 'invalid_request_error',
-              param: 'model',
-            },
-          });
-          console.warn('[GatewayReturningError]', 400, noCompatBody);
-          return new Response(
-            noCompatBody,
-            { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+          const noCompatMsg = `No compatible provider is configured for model '${body.model}'. Available providers: ${supported}.`;
+          console.warn('[GatewayReturningError]', 400, 'NO_PROVIDER_AVAILABLE', noCompatMsg);
+          return errorResponse(
+            400,
+            'NO_PROVIDER_AVAILABLE',
+            noCompatMsg,
+            'invalid_request_error',
+            corsHeaders,
+            { extras: { param: 'model' } },
           );
         }
 
@@ -1868,34 +1836,30 @@ const server = Bun.serve({
           if (!pinnedTracked) {
             inFlightRequests--;
             hasDecrementedInFlight = true;
-            const unknownBody = JSON.stringify({
-              error: {
-                message: `Unknown model '${body.model}'. No provider instance with that display name is configured.`,
-                type: 'invalid_request_error',
-                param: 'model',
-              },
-            });
-            console.warn('[GatewayReturningError]', 400, unknownBody);
-            return new Response(
-              unknownBody,
-              { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+            const unknownMsg = `Unknown model '${body.model}'. No provider instance with that display name is configured.`;
+            console.warn('[GatewayReturningError]', 400, 'NO_PROVIDER_AVAILABLE', unknownMsg);
+            return errorResponse(
+              400,
+              'NO_PROVIDER_AVAILABLE',
+              unknownMsg,
+              'invalid_request_error',
+              corsHeaders,
+              { extras: { param: 'model' } },
             );
           }
           if (!pinnedTracked.enabled || !isServiceAvailable(pinnedTracked)) {
             inFlightRequests--;
             hasDecrementedInFlight = true;
             const state = pinnedTracked.circuitBreaker.state;
-            const unavailBody = JSON.stringify({
-              error: {
-                message: `pinned model ${pinnedTracked.service.name} unavailable: circuit ${state}`,
-                type: 'service_unavailable',
-                param: 'model',
-              },
-            });
-            console.warn('[GatewayReturningError]', 503, unavailBody);
-            return new Response(
-              unavailBody,
-              { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+            const unavailMsg = `pinned model ${pinnedTracked.service.name} unavailable: circuit ${state}`;
+            console.warn('[GatewayReturningError]', 503, 'CIRCUIT_OPEN', unavailMsg);
+            return errorResponse(
+              503,
+              'CIRCUIT_OPEN',
+              unavailMsg,
+              'service_unavailable',
+              corsHeaders,
+              { extras: { param: 'model' } },
             );
           }
           // Strip the display-name string so base.ts:69 falls back to the service's default model.
@@ -2033,19 +1997,11 @@ const server = Bun.serve({
             }
           }
 
-          const gatewayErrorBody = JSON.stringify({
-            error: {
-              message: route.isUniversal
-                ? 'All providers failed or circuits are open'
-                : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`,
-              type: 'gateway_error',
-            },
-          });
-          console.warn('[GatewayReturningError]', 502, gatewayErrorBody);
-          return new Response(
-            gatewayErrorBody,
-            { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
-          );
+          const gatewayErrorMsg = route.isUniversal
+            ? 'All providers failed or circuits are open'
+            : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`;
+          console.warn('[GatewayReturningError]', 502, 'UPSTREAM_ERROR', gatewayErrorMsg);
+          return errorResponse(502, 'UPSTREAM_ERROR', gatewayErrorMsg, 'gateway_error', corsHeaders);
         }
 
         const stream = new ReadableStream({
@@ -2147,8 +2103,8 @@ const server = Bun.serve({
                 lastEmittedServiceName = service.name;
               };
 
-              const emitError = (message: string) => {
-                safeEnqueue(encoder.encode(`data: ${JSON.stringify({ error: { message, type: 'gateway_error' } })}\n\n`));
+              const emitError = (message: string, code: 'UPSTREAM_ERROR' = 'UPSTREAM_ERROR') => {
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify({ error: { message, type: 'gateway_error', code } })}\n\n`));
               };
 
               // Try each service with exponential backoff
@@ -2472,12 +2428,8 @@ const server = Bun.serve({
           inFlightRequests--;
         }
         console.error('Internal Server Error:', error);
-        const internalBody = JSON.stringify({ error: { message: 'Internal Error', type: 'internal_error' } });
-        console.warn('[GatewayReturningError]', 500, internalBody);
-        return new Response(
-          internalBody,
-          { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } }
-        );
+        console.warn('[GatewayReturningError]', 500, 'INTERNAL_ERROR', 'Internal Error');
+        return errorResponse(500, 'INTERNAL_ERROR', 'Internal Error', 'internal_error', corsHeaders);
       } finally {
         decrementInFlight();
       }
