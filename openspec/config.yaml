@@ -1,0 +1,34 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Bun + TypeScript, OpenAI-compatible AI gateway. Storage: Turso/LibSQL.
+  Architecture: Multi-provider router (openrouter/gemini/groq/cerebras/cloudflare) with circuit breaker, retry loop, SSE streaming with tool-call deltas. Per-token auth + master key + dashboard session HMAC.
+  Observability: pino structured logging with trace IDs, prom-client metrics at /metrics.
+  Testing: None automated; manual via test_client.ts.
+  Style: TypeScript strict (bunx tsc --noEmit); no formal linter configured.
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+    - Identify affected modules/packages
+  specs:
+    - Use Given/When/Then format for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+  tasks:
+    - Group tasks by phase (infrastructure, implementation, testing)
+    - Use hierarchical numbering (1.1, 1.2, etc.)
+    - Keep tasks small enough to complete in one session
+  apply:
+    - Follow existing code patterns and conventions
+    - Load relevant coding skills for the project stack
+    tdd: false
+    test_command: ""
+  verify:
+    test_command: ""
+    build_command: "bunx tsc --noEmit"
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas (large removals)
