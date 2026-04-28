@@ -12,6 +12,7 @@
 import OpenAI from 'openai';
 import { BaseOpenAIService } from './base';
 import type { ChatMessage, ChatOptions, ChatStreamChunk } from '../types';
+import { logger } from '../logger';
 
 export class GeminiService extends BaseOpenAIService {
   constructor(apiKey: string, instanceId: string = '1') {
@@ -53,8 +54,9 @@ export class GeminiService extends BaseOpenAIService {
         yield chunk;
       }
       if (!yieldedAnything) {
-        console.warn(
-          `[${this.name}] streaming completion yielded zero chunks (likely empty Gemini response)`
+        logger.warn(
+          { tag: 'GeminiEmptyStream', provider_name: this.name, provider: this.provider, model: options.model ?? null },
+          `[${this.name}] streaming completion yielded zero chunks (likely empty Gemini response)`,
         );
         throw new Error(
           `Gemini streaming yielded no chunks (model ${options.model ?? 'default'}). Triggering provider retry.`
@@ -72,9 +74,9 @@ export class GeminiService extends BaseOpenAIService {
       // Throwing here lets the gateway's retry-loop pick another provider.
       const choices = completion?.choices;
       if (!Array.isArray(choices) || choices.length === 0) {
-        console.warn(
+        logger.warn(
+          { tag: 'GeminiEmptyChoices', provider_name: this.name, provider: this.provider, model: options.model ?? null, completion_preview: JSON.stringify(completion).slice(0, 500) },
           `[${this.name}] empty completion received`,
-          JSON.stringify(completion).slice(0, 500)
         );
         throw new Error(
           `Gemini returned empty choices array (likely tools incompatibility ` +
@@ -111,7 +113,10 @@ export class GeminiService extends BaseOpenAIService {
         }
       }
     } catch (error) {
-      console.error(`[${this.name}] Error:`, error);
+      logger.error(
+        { tag: 'ProviderError', provider_name: this.name, provider: this.provider, err: error as Error },
+        `[${this.name}] Error: ${error instanceof Error ? error.message : String(error)}`,
+      );
       throw error;
     }
   }

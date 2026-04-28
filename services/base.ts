@@ -13,6 +13,7 @@ import type {
     ChatOptions,
     getTextContent
 } from '../types';
+import { logger } from '../logger';
 
 /**
  * Configuration options for OpenAI-compatible services
@@ -114,7 +115,10 @@ export abstract class BaseOpenAIService implements AIService {
                 }
             }
         } catch (error) {
-            console.error(`[${this.name}] Error:`, error);
+            logger.error(
+                { tag: 'ProviderError', provider_name: this.name, provider: this.provider, err: error as Error },
+                `[${this.name}] Error: ${error instanceof Error ? error.message : String(error)}`,
+            );
             throw error;
         }
     }
@@ -134,7 +138,10 @@ export abstract class BaseOpenAIService implements AIService {
 
             return completion;
         } catch (error) {
-            console.error(`[${this.name}] Error:`, error);
+            logger.error(
+                { tag: 'ProviderError', provider_name: this.name, provider: this.provider, err: error as Error },
+                `[${this.name}] Error: ${error instanceof Error ? error.message : String(error)}`,
+            );
             throw error;
         }
     }

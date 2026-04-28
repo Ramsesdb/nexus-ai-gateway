@@ -39,9 +39,17 @@ import type {
   TrackedService,
 } from './types';
 import { errorResponse } from './errors';
-
-const DEBUG_ENABLED = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
-const dlog = (...args: unknown[]) => { if (DEBUG_ENABLED) console.warn(...args); };
+import { logger, requestLogger, type RequestLogger } from './logger';
+import {
+  registry,
+  httpRequestsTotal,
+  httpRequestDuration,
+  upstreamRequestsTotal,
+  upstreamFirstTokenMs,
+  circuitBreakerState,
+  activeStreams,
+  circuitStateToNumber,
+} from './metrics';
 
 // --- 1. CONFIGURATION ---
 const CONFIG = {
@@ -185,9 +193,9 @@ const collectProviderKeys = (): ProviderKeyConfig[] => {
     const resolvedAccountId = perKeyAccountId || sharedCloudflareAccountId;
 
     if (!resolvedAccountId) {
-      console.warn(
-        `⚠️  Cloudflare key #${config.instanceId} has no matching ` +
-        `CLOUDFLARE_ACCOUNT_ID_${config.instanceId} (and no shared CLOUDFLARE_ACCOUNT_ID fallback) — skipping.`
+      logger.warn(
+        { tag: 'CloudflareInit', instance_id: config.instanceId },
+        `Cloudflare key #${config.instanceId} has no matching CLOUDFLARE_ACCOUNT_ID_${config.instanceId} (and no shared CLOUDFLARE_ACCOUNT_ID fallback) — skipping.`,
       );
       chosen.delete(key);
       continue;
@@ -283,7 +291,11 @@ const isServiceAvailable = (tracked: EnhancedTrackedService): boolean => {
         // Transition to half-open
         cb.state = 'HALF_OPEN';
         cb.halfOpenAttempts = 0;
-        console.log(`[CircuitBreaker] ${tracked.service.name}: OPEN -> HALF_OPEN`);
+        logger.info(
+          { tag: 'CircuitBreaker', provider_name: tracked.service.name, provider: tracked.service.provider, transition: 'OPEN->HALF_OPEN' },
+          `[CircuitBreaker] ${tracked.service.name}: OPEN -> HALF_OPEN`,
+        );
+        circuitBreakerState.set({ provider: tracked.service.name }, circuitStateToNumber('HALF_OPEN'));
         return true;
       }
       return false;
@@ -308,7 +320,11 @@ const recordSuccess = (tracked: EnhancedTrackedService): void => {
     cb.state = 'CLOSED';
     cb.failures = 0;
     cb.halfOpenAttempts = 0;
-    console.log(`[CircuitBreaker] ${tracked.service.name}: HALF_OPEN -> CLOSED (recovered)`);
+    logger.info(
+      { tag: 'CircuitBreaker', provider_name: tracked.service.name, provider: tracked.service.provider, transition: 'HALF_OPEN->CLOSED' },
+      `[CircuitBreaker] ${tracked.service.name}: HALF_OPEN -> CLOSED (recovered)`,
+    );
+    circuitBreakerState.set({ provider: tracked.service.name }, circuitStateToNumber('CLOSED'));
   } else if (cb.state === 'CLOSED') {
     // Reset failure count on success
     cb.failures = Math.max(0, cb.failures - 1);
@@ -326,12 +342,20 @@ const recordFailure = (tracked: EnhancedTrackedService): void => {
     // Failure in half-open state reopens the circuit
     cb.state = 'OPEN';
     cb.halfOpenAttempts = 0;
-    console.log(`[CircuitBreaker] ${tracked.service.name}: HALF_OPEN -> OPEN (still failing)`);
+    logger.warn(
+      { tag: 'CircuitBreaker', provider_name: tracked.service.name, provider: tracked.service.provider, transition: 'HALF_OPEN->OPEN' },
+      `[CircuitBreaker] ${tracked.service.name}: HALF_OPEN -> OPEN (still failing)`,
+    );
+    circuitBreakerState.set({ provider: tracked.service.name }, circuitStateToNumber('OPEN'));
   } else if (cb.state === 'CLOSED') {
     cb.failures++;
     if (cb.failures >= CONFIG.circuitBreaker.failureThreshold) {
       cb.state = 'OPEN';
-      console.log(`[CircuitBreaker] ${tracked.service.name}: CLOSED -> OPEN (threshold reached: ${cb.failures} failures)`);
+      logger.warn(
+        { tag: 'CircuitBreaker', provider_name: tracked.service.name, provider: tracked.service.provider, transition: 'CLOSED->OPEN', failures: cb.failures },
+        `[CircuitBreaker] ${tracked.service.name}: CLOSED -> OPEN (threshold reached: ${cb.failures} failures)`,
+      );
+      circuitBreakerState.set({ provider: tracked.service.name }, circuitStateToNumber('OPEN'));
     }
   }
 };
@@ -1362,6 +1386,7 @@ const server = Bun.serve({
     const requiresAuth =
       CONFIG.masterKey &&
       url.pathname !== '/health' &&
+      url.pathname !== '/metrics' &&
       !url.pathname.startsWith('/dashboard');
 
     // Endpoints that must always be authenticated by the master key, never by a
@@ -1682,6 +1707,21 @@ const server = Bun.serve({
       const referer = req.headers.get('referer') || '';
       const userAgent = req.headers.get('user-agent') || '';
 
+      const traceId = crypto.randomUUID();
+      const requestStartedAt = Date.now();
+      const log: RequestLogger = requestLogger(traceId, {
+        path: '/v1/chat/completions',
+        method: 'POST',
+      });
+      let metricsRecorded = false;
+      const recordRequestMetrics = (status: number, errorCode: string = '') => {
+        if (metricsRecorded) return;
+        metricsRecorded = true;
+        const labels = { method: 'POST', path: '/v1/chat/completions', status: String(status) } as const;
+        httpRequestsTotal.inc({ ...labels, error_code: errorCode || 'none' });
+        httpRequestDuration.observe(labels, Date.now() - requestStartedAt);
+      };
+
       const decrementInFlight = () => {
         if (!hasDecrementedInFlight) {
           hasDecrementedInFlight = true;
@@ -1722,15 +1762,19 @@ const server = Bun.serve({
             tools_count: Array.isArray(body.tools) ? (body.tools as unknown[]).length : undefined,
             tool_choice: body.tool_choice,
           });
-          dlog('[IncomingRequest-Start]', summary.slice(0, 2500));
+          log.debug({ tag: 'IncomingRequest-Start', summary: summary.slice(0, 2500) }, 'incoming chat completion request');
         } catch (logErr) {
-          dlog('[IncomingRequest-Start] <serialize-failed>', logErr);
+          log.debug({ tag: 'IncomingRequest-Start', err: logErr as Error }, 'serialize failed for incoming request summary');
         }
 
         if (!Array.isArray(messages) || !messages.every(isValidMessage)) {
           inFlightRequests--;
           hasDecrementedInFlight = true;
-          console.warn('[GatewayReturningError]', 400, 'INVALID_REQUEST', 'Invalid messages format');
+          log.warn(
+            { tag: 'GatewayReturningError', status: 400, error_code: 'INVALID_REQUEST', duration_ms: Date.now() - requestStartedAt },
+            'returning error: Invalid messages format',
+          );
+          recordRequestMetrics(400, 'INVALID_REQUEST');
           return errorResponse(400, 'INVALID_REQUEST', 'Invalid messages format', 'invalid_request_error', corsHeaders);
         }
 
@@ -1763,8 +1807,14 @@ const server = Bun.serve({
               : body.tool_choice === undefined
                 ? '(none)'
                 : (() => { try { return JSON.stringify(body.tool_choice); } catch { return '<unserializable>'; } })();
-          dlog(`[ProviderErrorBody] ${serviceName} status=${status} body=${errBody}`);
-          dlog(`[IncomingRequest] messages=${msgs} tools_count=${toolsCount} tool_choice=${toolChoice} model=${resolvedModel ?? '(none)'}`);
+          log.debug(
+            { tag: 'ProviderErrorBody', provider_name: serviceName, status, body: errBody },
+            `[ProviderErrorBody] ${serviceName} status=${status}`,
+          );
+          log.debug(
+            { tag: 'IncomingRequest', messages: msgs, tools_count: toolsCount, tool_choice: toolChoice, model: resolvedModel ?? null },
+            'incoming request body snapshot for failed provider',
+          );
         };
 
         const onAbort = () => { aborted = true; };
@@ -1795,9 +1845,15 @@ const server = Bun.serve({
         const modelConfigProvider = body.model && !isAutoPseudoModel ? getCachedModelProvider(body.model) : undefined;
         if (modelConfigProvider && configuredProviders.has(modelConfigProvider)) {
           resolvedAllowedProviders = new Set([modelConfigProvider]);
-          console.log(`[ModelConfig] Overriding route for '${body.model}' -> provider '${modelConfigProvider}'`);
+          log.info(
+            { tag: 'ModelConfig', model: body.model, provider: modelConfigProvider },
+            `[ModelConfig] Overriding route for '${body.model}' -> provider '${modelConfigProvider}'`,
+          );
         } else if (modelConfigProvider) {
-          console.warn(`[ModelConfig] Ignoring stale model_config row '${body.model}' -> '${modelConfigProvider}' (provider not configured); falling back to router route '${route.ruleLabel}'`);
+          log.warn(
+            { tag: 'ModelConfig', model: body.model, stale_provider: modelConfigProvider, rule: route.ruleLabel },
+            `[ModelConfig] Ignoring stale model_config row '${body.model}' -> '${modelConfigProvider}' (provider not configured); falling back to router route '${route.ruleLabel}'`,
+          );
         }
         const allowedProviders = resolvedAllowedProviders;
         const modelAliases = route.modelAliases;
@@ -1806,14 +1862,21 @@ const server = Bun.serve({
           .filter(ts => allowedProviders.has(ts.service.provider))
           .map(ts => ts.service.name);
 
-        console.log(`[Router] model=${body.model || '(default)'} rule=${route.ruleLabel} candidates=[${candidateList.join(', ') || 'none'}]`);
+        log.info(
+          { tag: 'Router', model: body.model || '(default)', rule: route.ruleLabel, candidates: candidateList },
+          `[Router] model=${body.model || '(default)'} rule=${route.ruleLabel} candidates=[${candidateList.join(', ') || 'none'}]`,
+        );
 
         if (compatibleProviders.length === 0) {
           inFlightRequests--;
           hasDecrementedInFlight = true;
           const supported = [...configuredProviders].join(', ');
           const noCompatMsg = `No compatible provider is configured for model '${body.model}'. Available providers: ${supported}.`;
-          console.warn('[GatewayReturningError]', 400, 'NO_PROVIDER_AVAILABLE', noCompatMsg);
+          log.warn(
+            { tag: 'GatewayReturningError', status: 400, error_code: 'NO_PROVIDER_AVAILABLE', model: body.model, duration_ms: Date.now() - requestStartedAt },
+            `returning error: ${noCompatMsg}`,
+          );
+          recordRequestMetrics(400, 'NO_PROVIDER_AVAILABLE');
           return errorResponse(
             400,
             'NO_PROVIDER_AVAILABLE',
@@ -1837,7 +1900,11 @@ const server = Bun.serve({
             inFlightRequests--;
             hasDecrementedInFlight = true;
             const unknownMsg = `Unknown model '${body.model}'. No provider instance with that display name is configured.`;
-            console.warn('[GatewayReturningError]', 400, 'NO_PROVIDER_AVAILABLE', unknownMsg);
+            log.warn(
+              { tag: 'GatewayReturningError', status: 400, error_code: 'NO_PROVIDER_AVAILABLE', model: body.model, duration_ms: Date.now() - requestStartedAt },
+              `returning error: ${unknownMsg}`,
+            );
+            recordRequestMetrics(400, 'NO_PROVIDER_AVAILABLE');
             return errorResponse(
               400,
               'NO_PROVIDER_AVAILABLE',
@@ -1852,7 +1919,11 @@ const server = Bun.serve({
             hasDecrementedInFlight = true;
             const state = pinnedTracked.circuitBreaker.state;
             const unavailMsg = `pinned model ${pinnedTracked.service.name} unavailable: circuit ${state}`;
-            console.warn('[GatewayReturningError]', 503, 'CIRCUIT_OPEN', unavailMsg);
+            log.warn(
+              { tag: 'GatewayReturningError', status: 503, error_code: 'CIRCUIT_OPEN', provider_name: pinnedTracked.service.name, circuit_state: state, duration_ms: Date.now() - requestStartedAt },
+              `returning error: ${unavailMsg}`,
+            );
+            recordRequestMetrics(503, 'CIRCUIT_OPEN');
             return errorResponse(
               503,
               'CIRCUIT_OPEN',
@@ -1876,7 +1947,10 @@ const server = Bun.serve({
               : getNextService(triedIndices, routingMode, allowedProviders);
             if (!tracked) {
               if (attemptNumber === 0) {
-                console.warn(`[Router] All candidates circuit-OPEN for rule=${route.ruleLabel}, model=${body.model ?? '(default)'}`);
+                log.warn(
+                  { tag: 'Router', rule: route.ruleLabel, model: body.model ?? '(default)' },
+                  `[Router] All candidates circuit-OPEN for rule=${route.ruleLabel}, model=${body.model ?? '(default)'}`,
+                );
               }
               break;
             }
@@ -1927,6 +2001,12 @@ const server = Bun.serve({
               tracked.metrics.successCount++;
               tracked.metrics.totalLatencyMs += Date.now() - startTime;
               recordSuccess(tracked);
+              upstreamRequestsTotal.inc({
+                provider: service.provider,
+                model: serviceOptions.model || service.name,
+                status: '200',
+                outcome: 'success',
+              });
 
               const usage = (completion as any)?.usage;
               const originIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
@@ -1954,6 +2034,11 @@ const server = Bun.serve({
                 void incrementTokenUsage(tokenIdAttr, tokensIn + tokensOut);
               }
 
+              log.info(
+                { tag: 'Router', provider_name: service.name, provider: service.provider, model: serviceOptions.model || service.name, attempt: attemptNumber - 1, duration_ms: Date.now() - startTime, status: 200 },
+                `[Router] non-streaming success via ${service.name}`,
+              );
+              recordRequestMetrics(200);
               return new Response(JSON.stringify(completion), {
                 headers: { 'Content-Type': 'application/json', ...corsHeaders },
               });
@@ -1961,13 +2046,33 @@ const server = Bun.serve({
               const errorMsg = err instanceof Error ? err.message : String(err);
               const status = extractHttpStatus(err);
               if (status === 404) {
-                console.error(`[Router] 404 from ${service.name} for model='${body.model}'. Provider misconfigured for this model; skipping.`);
+                log.error(
+                  { tag: 'Router', provider_name: service.name, provider: service.provider, status, model: body.model, attempt: attemptNumber - 1 },
+                  `[Router] 404 from ${service.name} for model='${body.model}'. Provider misconfigured for this model; skipping.`,
+                );
               } else if (status === 402) {
-                console.warn(`[Router] 402 insufficient credits on ${service.name}; moving to next compatible key.`);
+                log.warn(
+                  { tag: 'Router', provider_name: service.name, provider: service.provider, status, attempt: attemptNumber - 1 },
+                  `[Router] 402 insufficient credits on ${service.name}; moving to next compatible key.`,
+                );
               } else if (status === 429) {
                 const retry = extractRetryAfter(err);
-                console.warn(`[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`);
+                log.warn(
+                  { tag: 'Router', provider_name: service.name, provider: service.provider, status, retry_after_s: retry, attempt: attemptNumber - 1 },
+                  `[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`,
+                );
+              } else {
+                log.error(
+                  { tag: 'ProviderError', provider_name: service.name, provider: service.provider, status: status ?? null, attempt: attemptNumber - 1, err: err as Error },
+                  `[Provider Error] ${service.name} status=${status ?? 'n/a'}: ${errorMsg}`,
+                );
               }
+              upstreamRequestsTotal.inc({
+                provider: service.provider,
+                model: serviceOptions.model || service.name,
+                status: status ? String(status) : 'error',
+                outcome: 'failed',
+              });
               // TEMP DEBUG: surface provider bad-status body + incoming request for repro (4xx and 5xx).
               if (typeof status === 'number' && status >= 400) {
                 log4xxOnce(service.name, status, err, serviceOptions.model);
@@ -2000,9 +2105,21 @@ const server = Bun.serve({
           const gatewayErrorMsg = route.isUniversal
             ? 'All providers failed or circuits are open'
             : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`;
-          console.warn('[GatewayReturningError]', 502, 'UPSTREAM_ERROR', gatewayErrorMsg);
+          log.warn(
+            { tag: 'GatewayReturningError', status: 502, error_code: 'UPSTREAM_ERROR', model: body.model, rule: route.ruleLabel, duration_ms: Date.now() - requestStartedAt },
+            `returning error: ${gatewayErrorMsg}`,
+          );
+          recordRequestMetrics(502, 'UPSTREAM_ERROR');
           return errorResponse(502, 'UPSTREAM_ERROR', gatewayErrorMsg, 'gateway_error', corsHeaders);
         }
+
+        activeStreams.inc();
+        let activeStreamDecremented = false;
+        const decrementActiveStream = () => {
+          if (activeStreamDecremented) return;
+          activeStreamDecremented = true;
+          activeStreams.dec();
+        };
 
         const stream = new ReadableStream({
           async start(controller) {
@@ -2116,7 +2233,10 @@ const server = Bun.serve({
                   // All circuits might be open - wait and check again
                   if (attemptNumber > 0 && !pinnedTracked) {
                     const backoffDelay = calculateBackoffDelay(attemptNumber);
-                    console.log(`[Router] All available circuits tried. Waiting ${backoffDelay}ms before checking again...`);
+                    log.info(
+                      { tag: 'Router', backoff_ms: backoffDelay, attempt: attemptNumber },
+                      `[Router] All available circuits tried. Waiting ${backoffDelay}ms before checking again...`,
+                    );
                     await sleep(backoffDelay);
 
                     // Check if any circuit has reopened among compatible providers
@@ -2128,7 +2248,10 @@ const server = Bun.serve({
                     if (!reopened) break;
                     continue;
                   }
-                  console.warn(`[Router] All candidates circuit-OPEN for rule=${route.ruleLabel}, model=${body.model ?? '(default)'}`);
+                  log.warn(
+                    { tag: 'Router', rule: route.ruleLabel, model: body.model ?? '(default)' },
+                    `[Router] All candidates circuit-OPEN for rule=${route.ruleLabel}, model=${body.model ?? '(default)'}`,
+                  );
                   break;
                 }
 
@@ -2139,7 +2262,10 @@ const server = Bun.serve({
                 // Apply backoff delay between retries (not on first attempt)
                 if (attemptNumber > 1) {
                   const backoffDelay = calculateBackoffDelay(attemptNumber - 1);
-                  console.log(`[Router] Backoff: waiting ${backoffDelay}ms before attempt ${attemptNumber}`);
+                  log.debug(
+                    { tag: 'Router', backoff_ms: backoffDelay, attempt: attemptNumber },
+                    `[Router] Backoff: waiting ${backoffDelay}ms before attempt ${attemptNumber}`,
+                  );
                   await sleep(backoffDelay);
                 }
 
@@ -2163,7 +2289,10 @@ const server = Bun.serve({
                   tracked.circuitBreaker.halfOpenAttempts++;
                 }
 
-                console.log(`[Router] Attempt ${attemptNumber}/${trackedServices.length} -> ${service.name} [${tracked.circuitBreaker.state}] mode=${routingMode}`);
+                log.info(
+                  { tag: 'Router', attempt: attemptNumber - 1, total: trackedServices.length, provider_name: service.name, provider: service.provider, circuit_state: tracked.circuitBreaker.state, routing_mode: routingMode, model: streamOptions.model },
+                  `[Router] Attempt ${attemptNumber}/${trackedServices.length} -> ${service.name} [${tracked.circuitBreaker.state}] mode=${routingMode}`,
+                );
                 tracked.metrics.totalRequests++;
 
                 try {
@@ -2228,11 +2357,16 @@ const server = Bun.serve({
 
                   if (!firstResult.done && firstResult.value) {
                     started = true;
-                    console.log(`[Router] Streaming started with: ${service.name}`);
+                    const firstTokenMs = Date.now() - startTime;
+                    upstreamFirstTokenMs.observe({ provider: service.provider }, firstTokenMs);
+                    log.info(
+                      { tag: 'Router', provider_name: service.name, provider: service.provider, attempt: attemptNumber - 1, first_token_ms: firstTokenMs },
+                      `[Router] Streaming started with: ${service.name}`,
+                    );
                     // Emit metadata before first chunk
                     emitMetadata(
                       service,
-                      Date.now() - startTime,
+                      firstTokenMs,
                       tracked.circuitBreaker.state,
                       calculateHealthScore(tracked)
                     );
@@ -2242,6 +2376,12 @@ const server = Bun.serve({
                     tracked.metrics.successCount++;
                     tracked.metrics.totalLatencyMs += Date.now() - startTime;
                     recordSuccess(tracked);
+                    upstreamRequestsTotal.inc({
+                      provider: service.provider,
+                      model: streamOptions.model || service.name,
+                      status: '200',
+                      outcome: 'success',
+                    });
                     const streamUsage1 = (service as any).lastStreamUsage;
                     const streamOriginIp1 = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
                     const stream1In = streamUsage1?.prompt_tokens ?? 0;
@@ -2279,10 +2419,15 @@ const server = Bun.serve({
                     if (chunk) {
                       if (!started) {
                         started = true;
-                        console.log(`[Router] Streaming started with: ${service.name}`);
+                        const firstTokenMs = Date.now() - startTime;
+                        upstreamFirstTokenMs.observe({ provider: service.provider }, firstTokenMs);
+                        log.info(
+                          { tag: 'Router', provider_name: service.name, provider: service.provider, attempt: attemptNumber - 1, first_token_ms: firstTokenMs },
+                          `[Router] Streaming started with: ${service.name}`,
+                        );
                         emitMetadata(
                           service,
-                          Date.now() - startTime,
+                          firstTokenMs,
                           tracked.circuitBreaker.state,
                           calculateHealthScore(tracked)
                         );
@@ -2295,6 +2440,12 @@ const server = Bun.serve({
                     tracked.metrics.successCount++;
                     tracked.metrics.totalLatencyMs += Date.now() - startTime;
                     recordSuccess(tracked);
+                    upstreamRequestsTotal.inc({
+                      provider: service.provider,
+                      model: streamOptions.model || service.name,
+                      status: '200',
+                      outcome: 'success',
+                    });
                     const streamUsage2 = (service as any).lastStreamUsage;
                     const streamOriginIp2 = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
                     const stream2In = streamUsage2?.prompt_tokens ?? 0;
@@ -2322,14 +2473,39 @@ const server = Bun.serve({
                 } catch (err) {
                   const errorMsg = err instanceof Error ? err.message : String(err);
                   const status = extractHttpStatus(err);
-                  console.error(`[Provider Error] ${service.name} status=${status ?? 'n/a'}:`, errorMsg);
+                  log.error(
+                    { tag: 'ProviderError', provider_name: service.name, provider: service.provider, status: status ?? null, attempt: attemptNumber - 1, err: err as Error },
+                    `[Provider Error] ${service.name} status=${status ?? 'n/a'}: ${errorMsg}`,
+                  );
                   if (status === 404) {
-                    console.error(`[Router] 404 from ${service.name} for model='${body.model}'. Provider misconfigured for this model; skipping.`);
+                    log.error(
+                      { tag: 'Router', provider_name: service.name, provider: service.provider, model: body.model, status, attempt: attemptNumber - 1 },
+                      `[Router] 404 from ${service.name} for model='${body.model}'. Provider misconfigured for this model; skipping.`,
+                    );
                   } else if (status === 402) {
-                    console.warn(`[Router] 402 insufficient credits on ${service.name}; moving to next compatible key.`);
+                    log.warn(
+                      { tag: 'Router', provider_name: service.name, provider: service.provider, status, attempt: attemptNumber - 1 },
+                      `[Router] 402 insufficient credits on ${service.name}; moving to next compatible key.`,
+                    );
                   } else if (status === 429) {
                     const retry = extractRetryAfter(err);
-                    console.warn(`[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`);
+                    log.warn(
+                      { tag: 'Router', provider_name: service.name, provider: service.provider, status, retry_after_s: retry, attempt: attemptNumber - 1 },
+                      `[Router] 429 rate-limited on ${service.name}${retry ? ` (retry-after=${retry}s)` : ''}; moving to next compatible key.`,
+                    );
+                  }
+                  upstreamRequestsTotal.inc({
+                    provider: service.provider,
+                    model: streamOptions.model || service.name,
+                    status: status ? String(status) : 'error',
+                    outcome: 'failed',
+                  });
+                  // First-token timeout records a separate observation (Pino message) — caught by the `Error` shape.
+                  if (errorMsg.startsWith('First token timeout')) {
+                    log.warn(
+                      { tag: 'FirstTokenTimeout', provider_name: service.name, provider: service.provider, attempt: attemptNumber - 1 },
+                      `[FirstTokenTimeout] ${service.name}: ${errorMsg}`,
+                    );
                   }
                   // TEMP DEBUG: surface provider bad-status body + incoming request for repro (4xx and 5xx).
                   if (typeof status === 'number' && status >= 400) {
@@ -2371,7 +2547,11 @@ const server = Bun.serve({
                 const streamErrMsg = route.isUniversal
                   ? 'All providers failed or circuits are open'
                   : `All compatible providers failed for model '${body.model}' (rule: ${route.ruleLabel})`;
-                console.warn('[GatewayReturningError]', 'stream', streamErrMsg);
+                log.warn(
+                  { tag: 'GatewayReturningError', stream: true, error_code: 'UPSTREAM_ERROR', model: body.model, rule: route.ruleLabel, duration_ms: Date.now() - requestStartedAt },
+                  `returning stream error: ${streamErrMsg}`,
+                );
+                if (!metricsRecorded) recordRequestMetrics(502, 'UPSTREAM_ERROR');
                 emitError(streamErrMsg);
               }
 
@@ -2395,21 +2575,26 @@ const server = Bun.serve({
 
               safeEnqueue(encoder.encode('data: [DONE]\n\n'));
               safeClose();
+              if (!metricsRecorded) recordRequestMetrics(200);
             } catch (err) {
-              console.error('[Stream Error]', err);
+              log.error({ tag: 'StreamError', err: err as Error }, '[Stream Error] unhandled error in SSE stream');
               try {
                 safeEnqueue(encoder.encode('data: [DONE]\n\n'));
               } catch { /* ignore */ }
               safeClose();
+              if (!metricsRecorded) recordRequestMetrics(500, 'INTERNAL_ERROR');
             } finally {
               req.signal?.removeEventListener?.('abort', onAbort);
               decrementInFlight();
+              decrementActiveStream();
             }
           },
           cancel() {
             aborted = true;
             req.signal?.removeEventListener?.('abort', onAbort);
             decrementInFlight();
+            decrementActiveStream();
+            if (!metricsRecorded) recordRequestMetrics(499, 'CLIENT_ABORTED');
           },
         });
 
@@ -2427,12 +2612,35 @@ const server = Bun.serve({
           hasDecrementedInFlight = true;
           inFlightRequests--;
         }
-        console.error('Internal Server Error:', error);
-        console.warn('[GatewayReturningError]', 500, 'INTERNAL_ERROR', 'Internal Error');
+        log.error(
+          { tag: 'InternalServerError', err: error as Error, duration_ms: Date.now() - requestStartedAt },
+          'Internal Server Error',
+        );
+        log.warn(
+          { tag: 'GatewayReturningError', status: 500, error_code: 'INTERNAL_ERROR', duration_ms: Date.now() - requestStartedAt },
+          'returning error: Internal Error',
+        );
+        recordRequestMetrics(500, 'INTERNAL_ERROR');
         return errorResponse(500, 'INTERNAL_ERROR', 'Internal Error', 'internal_error', corsHeaders);
       } finally {
         decrementInFlight();
       }
+    }
+
+    // Prometheus metrics endpoint (gated by optional METRICS_TOKEN bearer token)
+    if (req.method === 'GET' && url.pathname === '/metrics') {
+      const metricsToken = process.env.METRICS_TOKEN;
+      if (metricsToken) {
+        const auth = req.headers.get('authorization');
+        if (auth !== `Bearer ${metricsToken}`) {
+          return errorResponse(401, 'AUTH_INVALID', 'Invalid metrics token', 'authentication_error', corsHeaders);
+        }
+      }
+      const body = await registry.metrics();
+      return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': registry.contentType, ...corsHeaders },
+      });
     }
 
     return new Response('Not Found', { status: 404, headers: corsHeaders });

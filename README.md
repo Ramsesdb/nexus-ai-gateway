@@ -229,6 +229,69 @@ after the SSE stream has already started is delivered as a single
 
 ---
 
+### Observability
+
+The gateway emits **structured JSON logs** (one event per line) and exposes a
+**Prometheus-compatible `/metrics` endpoint**.
+
+#### Logs
+
+Every log line includes `service: "nexus-gateway"`. Lines emitted from the
+chat-completions hot path additionally carry a `trace_id` (UUID) so a single
+request's routing decisions, retries, and circuit-breaker transitions can be
+correlated. Example:
+
+```json
+{"level":30,"time":1714330000123,"service":"nexus-gateway","trace_id":"5e1f...","path":"/v1/chat/completions","method":"POST","tag":"Router","model":"openai/gpt-4.1-mini","rule":"openai/*","candidates":["OpenRouter (Key #1)","Gemini (Key #1)","Groq (Key #1)"],"msg":"[Router] model=openai/gpt-4.1-mini rule=openai/* candidates=[OpenRouter (Key #1), Gemini (Key #1), Groq (Key #1)]"}
+```
+
+Configuration (env):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOG_LEVEL` | `info` | `trace`/`debug`/`info`/`warn`/`error`/`fatal` |
+| `DEBUG=1` | unset | Legacy alias — sets level to `debug` if `LOG_LEVEL` is unset |
+| `NODE_ENV=production` | unset | Disables `pino-pretty`; emits raw JSON for log shippers |
+
+In dev (`NODE_ENV !== production`), logs are pretty-printed with colors via
+`pino-pretty`. Authorization/cookie headers and `*.api_key` / `*.password`
+fields are redacted automatically.
+
+#### Metrics
+
+`GET /metrics` returns Prometheus exposition format. Set `METRICS_TOKEN=<token>`
+to require `Authorization: Bearer <token>` on the endpoint (otherwise it is
+open — assume your scraper sits on a private network).
+
+Exposed metrics:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `gateway_requests_total` | counter | `method`, `path`, `status`, `error_code` |
+| `gateway_request_duration_ms` | histogram | `method`, `path`, `status` |
+| `gateway_upstream_requests_total` | counter | `provider`, `model`, `status`, `outcome` (`success`/`failed`) |
+| `gateway_upstream_first_token_ms` | histogram | `provider` |
+| `gateway_circuit_breaker_state` | gauge (0=closed, 1=open, 2=half-open) | `provider` |
+| `gateway_active_streams` | gauge | — |
+
+Plus the default Node/Bun process metrics (`process_cpu_*`, `nodejs_eventloop_lag_seconds`, `nodejs_heap_size_*`, etc.) auto-collected by `prom-client`.
+
+Example Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: nexus-gateway
+    metrics_path: /metrics
+    scheme: https
+    static_configs:
+      - targets: ['api.ramsesdb.tech']
+    authorization:
+      type: Bearer
+      credentials: <METRICS_TOKEN>
+```
+
+---
+
 ## ⚙️ Configuration
 
 ### Environment Variables
